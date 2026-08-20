@@ -1,0 +1,18 @@
+# Artefatos de build / empacotamento (PyInstaller)
+build/
+dist/
+*.spec.bak
+
+# Cache Python
+__pycache__/
+*.pyc
+
+# Dados locais gerados em tempo de execução (contém dados de clientes)
+historico_recentes.json
+config_app.json
+
+# Saídas de exemplo
+Output/
+
+# XMLs de exemplo com dados reais de cliente (nome, CPF, telefone, endereço)
+Conf - Cozinha.xml
