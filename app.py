@@ -18,7 +18,7 @@ from tkinter import filedialog, messagebox, ttk
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 
-VERSAO_ATUAL = "1.0.0"
+VERSAO_ATUAL = "1.1.0"
 URL_VERSAO_REMOTA = (
     "https://raw.githubusercontent.com/Ariane-Prado/conversorplanodecorte"
     "/main/versao.json"
