@@ -2,7 +2,10 @@ import datetime
 import json
 import os
 import re
+import subprocess
 import sys
+import threading
+import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 import customtkinter as ctk
@@ -14,6 +17,12 @@ from tkinter import filedialog, messagebox, ttk
 # Configuração do tema visual da interface
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
+
+VERSAO_ATUAL = "1.0.0"
+URL_VERSAO_REMOTA = (
+    "https://raw.githubusercontent.com/Ariane-Prado/conversorplanodecorte"
+    "/main/versao.json"
+)
 
 LIMITE_MAX_COMPRIMENTO = 2740.0
 LIMITE_MAX_LARGURA = 1840.0
@@ -329,6 +338,99 @@ def salvar_config(novos_valores: dict) -> None:
       json.dump(atual, f, ensure_ascii=False, indent=2)
   except Exception as e:
     print(f"Erro ao salvar configuração: {e}")
+
+
+def _versao_para_tupla(versao_str: str) -> tuple:
+  try:
+    return tuple(int(p) for p in versao_str.strip().split("."))
+  except (ValueError, AttributeError):
+    return (0,)
+
+
+def verificar_nova_versao():
+  """Consulta o manifesto remoto (versao.json).
+
+  Retorna (versao_nova, url_download) se houver versão mais nova que
+  VERSAO_ATUAL, ou None se estiver atualizado / a checagem falhar (sem
+  internet, repositório fora do ar etc. — nunca levanta exceção).
+  """
+  try:
+    with urllib.request.urlopen(URL_VERSAO_REMOTA, timeout=6) as resp:
+      dados = json.loads(resp.read().decode("utf-8"))
+    versao_remota = str(dados.get("versao", "")).strip()
+    url_download = str(dados.get("url_download", "")).strip()
+    if not versao_remota or not url_download:
+      return None
+    if _versao_para_tupla(versao_remota) > _versao_para_tupla(VERSAO_ATUAL):
+      return versao_remota, url_download
+    return None
+  except Exception as e:
+    print(f"Aviso: falha ao verificar atualização: {e}")
+    return None
+
+
+def baixar_atualizacao(url_download: str, destino: str, progresso_callback=None):
+  """Baixa o novo executável para 'destino'. Levanta exceção se falhar."""
+  req = urllib.request.Request(url_download, headers={"User-Agent": "Mozilla/5.0"})
+  with urllib.request.urlopen(req, timeout=30) as resp:
+    total = int(resp.headers.get("Content-Length", 0))
+    lido = 0
+    with open(destino, "wb") as f:
+      while True:
+        bloco = resp.read(65536)
+        if not bloco:
+          break
+        f.write(bloco)
+        lido += len(bloco)
+        if progresso_callback:
+          progresso_callback(lido, total)
+
+  if os.path.getsize(destino) < 100_000:
+    with open(destino, "rb") as f:
+      inicio = f.read(300).lower()
+    os.remove(destino)
+    if b"<html" in inicio or b"<!doctype" in inicio:
+      raise RuntimeError(
+          "O link de download retornou uma página HTML em vez do arquivo"
+          " .exe. Verifique se 'url_download' no versao.json é um link"
+          " direto de download."
+      )
+    raise RuntimeError("Arquivo baixado parece inválido (muito pequeno).")
+
+
+def aplicar_atualizacao_e_reiniciar(caminho_novo_exe: str):
+  """Substitui o .exe em execução pelo baixado e reabre o app (Windows).
+
+  Um .exe não pode se auto-sobrescrever enquanto roda, então isso grava um
+  .bat que espera este processo terminar, move o arquivo novo por cima do
+  antigo, reabre o app e se autodestrói.
+  """
+  exe_atual = sys.executable
+  pasta = os.path.dirname(exe_atual)
+  bat_path = os.path.join(pasta, "_atualizar.bat")
+  pid_atual = os.getpid()
+
+  conteudo_bat = (
+      "@echo off\n"
+      ":espera\n"
+      f'tasklist /FI "PID eq {pid_atual}" 2>NUL | find /I "{pid_atual}" >NUL\n'
+      "if not errorlevel 1 (\n"
+      "    timeout /t 1 /nobreak >NUL\n"
+      "    goto espera\n"
+      ")\n"
+      f'move /Y "{caminho_novo_exe}" "{exe_atual}" >NUL\n'
+      f'start "" "{exe_atual}"\n'
+      'del "%~f0"\n'
+  )
+  with open(bat_path, "w", encoding="utf-8") as f:
+    f.write(conteudo_bat)
+
+  subprocess.Popen(
+      ["cmd", "/c", bat_path],
+      creationflags=subprocess.CREATE_NO_WINDOW,
+      close_fds=True,
+  )
+  os._exit(0)
 
 
 class JanelaTutorial(ctk.CTkToplevel):
@@ -1125,6 +1227,18 @@ class ConversorXmlExcelApp(ctk.CTk):
     )
     self.btn_ajuda.pack(side="right")
 
+    self.btn_verificar_update = ctk.CTkButton(
+        self.frame_topo,
+        text="🔄 Verificar Atualizações",
+        width=180,
+        height=30,
+        fg_color="#2980b9",
+        hover_color="#3498db",
+        font=ctk.CTkFont(size=12, weight="bold"),
+        command=self.verificar_atualizacoes_manual,
+    )
+    self.btn_verificar_update.pack(side="right", padx=(0, 8))
+
     self.container = ctk.CTkFrame(self, fg_color="transparent")
     self.container.pack(fill="both", expand=True, padx=10, pady=10)
     self.container.grid_rowconfigure(0, weight=1)
@@ -1132,7 +1246,7 @@ class ConversorXmlExcelApp(ctk.CTk):
 
     self.lbl_footer = ctk.CTkLabel(
         self,
-        text="Desenvolvido por Ariane Prado",
+        text=f"Desenvolvido por Ariane Prado · v{VERSAO_ATUAL}",
         font=ctk.CTkFont(size=11, weight="bold"),
         text_color="gray",
     )
@@ -1147,6 +1261,7 @@ class ConversorXmlExcelApp(ctk.CTk):
 
     self.show_frame("TelaInicio")
     self.after(400, self.mostrar_tutorial_se_necessario)
+    self.after(1200, self.verificar_atualizacao_em_segundo_plano)
 
   def show_frame(self, page_name):
     frame = self.frames[page_name]
@@ -1160,6 +1275,120 @@ class ConversorXmlExcelApp(ctk.CTk):
   def mostrar_tutorial_se_necessario(self):
     if not carregar_config().get("tutorial_visto", False):
       self.abrir_tutorial()
+
+  # --- Atualização automática -------------------------------------------
+
+  def verificar_atualizacao_em_segundo_plano(self):
+    def worker():
+      resultado = verificar_nova_versao()
+      if resultado:
+        self.after(0, lambda: self._notificar_nova_versao(*resultado))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+  def verificar_atualizacoes_manual(self):
+    self.btn_verificar_update.configure(
+        state="disabled", text="🔄 Verificando..."
+    )
+
+    def worker():
+      resultado = verificar_nova_versao()
+      self.after(0, lambda: self._resultado_verificacao_manual(resultado))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+  def _resultado_verificacao_manual(self, resultado):
+    self.btn_verificar_update.configure(
+        state="normal", text="🔄 Verificar Atualizações"
+    )
+    if resultado:
+      self._notificar_nova_versao(*resultado)
+    else:
+      messagebox.showinfo(
+          "Sem atualizações",
+          f"Você já está usando a versão mais recente (v{VERSAO_ATUAL}).",
+      )
+
+  def _notificar_nova_versao(self, versao_nova, url_download):
+    resposta = messagebox.askyesno(
+        "Atualização disponível",
+        f"Uma nova versão está disponível: v{versao_nova}\n"
+        f"(você está usando v{VERSAO_ATUAL}).\n\n"
+        "Deseja baixar e atualizar agora? O aplicativo vai fechar e reabrir"
+        " sozinho ao terminar.",
+    )
+    if resposta:
+      self._iniciar_download_atualizacao(versao_nova, url_download)
+
+  def _iniciar_download_atualizacao(self, versao_nova, url_download):
+    if not getattr(sys, "frozen", False):
+      messagebox.showwarning(
+          "Atualização automática indisponível",
+          "A troca automática do executável só funciona no aplicativo"
+          " instalado (.exe). Você está rodando a partir do código-fonte —"
+          f" baixe e substitua manualmente pelo link:\n\n{url_download}",
+      )
+      return
+
+    janela = ctk.CTkToplevel(self)
+    janela.title("Atualizando")
+    janela.geometry("380x130")
+    janela.resizable(False, False)
+    janela.transient(self)
+    janela.grab_set()
+
+    ctk.CTkLabel(
+        janela,
+        text=f"Baixando versão {versao_nova}...",
+        font=ctk.CTkFont(size=13, weight="bold"),
+    ).pack(pady=(20, 10))
+
+    barra = ctk.CTkProgressBar(janela, width=300)
+    barra.pack(pady=5)
+    barra.set(0)
+
+    lbl_pct = ctk.CTkLabel(
+        janela, text="0%", font=ctk.CTkFont(size=11), text_color="gray"
+    )
+    lbl_pct.pack()
+
+    def progresso(lido, total):
+      if total > 0:
+        frac = lido / total
+        self.after(
+            0,
+            lambda: (barra.set(frac), lbl_pct.configure(text=f"{int(frac * 100)}%")),
+        )
+
+    def worker():
+      pasta = os.path.dirname(sys.executable)
+      destino = os.path.join(pasta, f"_app_novo_{versao_nova}.exe")
+      try:
+        baixar_atualizacao(url_download, destino, progresso_callback=progresso)
+      except Exception as e:
+        self.after(0, lambda: self._erro_download(janela, e))
+        return
+      self.after(0, lambda: self._finalizar_atualizacao(destino))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+  def _erro_download(self, janela_progresso, erro):
+    janela_progresso.destroy()
+    messagebox.showerror(
+        "Erro ao baixar atualização",
+        f"Não foi possível baixar a atualização:\n{erro}",
+    )
+
+  def _finalizar_atualizacao(self, destino):
+    try:
+      aplicar_atualizacao_e_reiniciar(destino)
+    except Exception as e:
+      messagebox.showerror(
+          "Erro ao aplicar atualização",
+          "O download terminou, mas não foi possível trocar o executável"
+          f" automaticamente:\n{e}\n\nO arquivo baixado está em:\n{destino}"
+          "\n\nFeche o programa e substitua manualmente se quiser.",
+      )
 
   def carregar_historico(self):
     if os.path.exists(self.arquivo_historico):

@@ -3,9 +3,11 @@
 Roda sem precisar abrir a interface gráfica (usa apenas xml.etree, sem Tk).
 Execução: python -m unittest discover -s tests -v
 """
+import io
 import os
 import sys
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -190,6 +192,107 @@ class TestComXmlReal(unittest.TestCase):
     cliente, ambiente = app.extrair_cliente_ambiente_xml(XML_EXEMPLO)
     self.assertTrue(cliente)
     self.assertTrue(ambiente)
+
+
+class _FakeResponse(io.BytesIO):
+  """Simula o objeto retornado por urllib.request.urlopen (usado com 'with')."""
+
+  def __init__(self, data: bytes, headers: dict = None):
+    super().__init__(data)
+    self.headers = headers or {}
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, *args):
+    self.close()
+
+
+class TestVersaoParaTupla(unittest.TestCase):
+
+  def test_versao_simples(self):
+    self.assertEqual(app._versao_para_tupla("1.2.3"), (1, 2, 3))
+
+  def test_versao_invalida_vira_zero(self):
+    self.assertEqual(app._versao_para_tupla("abc"), (0,))
+
+  def test_versao_vazia_vira_zero(self):
+    self.assertEqual(app._versao_para_tupla(""), (0,))
+
+  def test_comparacao_semantica(self):
+    self.assertGreater(app._versao_para_tupla("1.10.0"), app._versao_para_tupla("1.9.0"))
+
+
+class TestVerificarNovaVersao(unittest.TestCase):
+
+  def setUp(self):
+    self._versao_original = app.VERSAO_ATUAL
+
+  def tearDown(self):
+    app.VERSAO_ATUAL = self._versao_original
+
+  def test_detecta_versao_mais_nova(self):
+    app.VERSAO_ATUAL = "1.0.0"
+    payload = b'{"versao": "1.1.0", "url_download": "https://exemplo.com/app.exe"}'
+    with mock.patch("app.urllib.request.urlopen", return_value=_FakeResponse(payload)):
+      resultado = app.verificar_nova_versao()
+    self.assertEqual(resultado, ("1.1.0", "https://exemplo.com/app.exe"))
+
+  def test_nao_notifica_se_ja_atualizado(self):
+    app.VERSAO_ATUAL = "1.1.0"
+    payload = b'{"versao": "1.0.0", "url_download": "https://exemplo.com/app.exe"}'
+    with mock.patch("app.urllib.request.urlopen", return_value=_FakeResponse(payload)):
+      resultado = app.verificar_nova_versao()
+    self.assertIsNone(resultado)
+
+  def test_falha_de_rede_nao_propaga_excecao(self):
+    with mock.patch("app.urllib.request.urlopen", side_effect=OSError("sem rede")):
+      resultado = app.verificar_nova_versao()
+    self.assertIsNone(resultado)
+
+  def test_manifesto_incompleto_retorna_none(self):
+    payload = b'{"versao": "9.9.9"}'  # sem url_download
+    with mock.patch("app.urllib.request.urlopen", return_value=_FakeResponse(payload)):
+      resultado = app.verificar_nova_versao()
+    self.assertIsNone(resultado)
+
+
+class TestBaixarAtualizacao(unittest.TestCase):
+
+  def test_conteudo_html_e_rejeitado(self):
+    import tempfile
+    pagina_html = b"<html><body>Google Drive scan warning</body></html>"
+    with tempfile.TemporaryDirectory() as tmp:
+      destino = os.path.join(tmp, "app_novo.exe")
+      with mock.patch(
+          "app.urllib.request.urlopen", return_value=_FakeResponse(pagina_html)
+      ):
+        with self.assertRaises(RuntimeError):
+          app.baixar_atualizacao("https://exemplo.com/app.exe", destino)
+      self.assertFalse(os.path.exists(destino), "arquivo inválido deveria ser removido")
+
+  def test_download_valido_grava_arquivo_e_reporta_progresso(self):
+    import tempfile
+    conteudo = b"X" * 200_000  # simula um .exe pequeno, acima do limiar de 100KB
+    chamadas_progresso = []
+    with tempfile.TemporaryDirectory() as tmp:
+      destino = os.path.join(tmp, "app_novo.exe")
+      headers = {"Content-Length": str(len(conteudo))}
+      with mock.patch(
+          "app.urllib.request.urlopen",
+          return_value=_FakeResponse(conteudo, headers=headers),
+      ):
+        app.baixar_atualizacao(
+            "https://exemplo.com/app.exe",
+            destino,
+            progresso_callback=lambda lido, total: chamadas_progresso.append(
+                (lido, total)
+            ),
+        )
+      self.assertTrue(os.path.exists(destino))
+      self.assertEqual(os.path.getsize(destino), len(conteudo))
+      self.assertTrue(chamadas_progresso)
+      self.assertEqual(chamadas_progresso[-1], (len(conteudo), len(conteudo)))
 
 
 if __name__ == "__main__":
