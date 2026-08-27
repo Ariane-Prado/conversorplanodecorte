@@ -1008,7 +1008,10 @@ class JanelaRevisao(ctk.CTkToplevel):
     self.df = df.copy()
     self.callback_salvar = callback_salvar
 
-    self.transient(parent)
+    # Sem transient(): no Windows, uma janela "transient" (presa à janela
+    # dona) perde os botões de minimizar/maximizar — é comportamento nativo
+    # de janela "owned", não uma opção separada. grab_set() sozinho já basta
+    # para manter o comportamento modal (bloqueia a janela principal).
     if iniciar_grab:
       self.grab_set()
 
@@ -1095,6 +1098,7 @@ class JanelaRevisao(ctk.CTkToplevel):
     self.frame_tabla.grid_columnconfigure(0, weight=1)
     self.frame_tabla.grid_rowconfigure(0, weight=1)
 
+    self.tree.bind("<Button-1>", self._alternar_selecao_linha)
     self.tree.bind("<Double-1>", self.on_double_click)
     self.tree.bind("<Motion>", self.on_mouse_hover)
     self.tree.bind("<<TreeviewSelect>>", self.atualizar_contagem_selecionadas)
@@ -1286,6 +1290,21 @@ class JanelaRevisao(ctk.CTkToplevel):
       )
     else:
       self.lbl_selecionadas.configure(text="")
+
+  def _alternar_selecao_linha(self, event):
+    if self.tree.identify("region", event.x, event.y) not in ("cell", "tree"):
+      return None
+
+    row_id = self.tree.identify_row(event.y)
+    if not row_id:
+      return None
+
+    selecionadas = self.tree.selection()
+    if row_id in selecionadas and len(selecionadas) == 1:
+      self.tree.selection_remove(row_id)
+      return "break"
+
+    return None
 
   def selecionar_todas(self):
     self.tree.selection_set(self.tree.get_children())
