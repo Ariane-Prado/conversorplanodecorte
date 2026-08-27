@@ -523,6 +523,12 @@ def aplicar_atualizacao_e_reiniciar(caminho_novo_exe: str):
   bloquear por heurística de auto-replicação, mesmo sendo legítimo aqui.
   O arquivo `_atualizar.bat` fica na pasta do app e é sobrescrito na
   próxima atualização.
+
+  O `move` tem retry: mesmo depois do processo antigo sumir do tasklist,
+  o Windows (ou o antivírus fazendo scan em tempo real do .exe recém-
+  baixado) pode segurar o arquivo travado por mais um instante — sem
+  retry isso falhava com "Acesso negado" e reabria o app antigo sem
+  trocar nada.
   """
   exe_atual = sys.executable
   pasta = os.path.dirname(exe_atual)
@@ -539,7 +545,20 @@ def aplicar_atualizacao_e_reiniciar(caminho_novo_exe: str):
       "    timeout /t 1 /nobreak >NUL\n"
       "    goto espera\n"
       ")\n"
-      f'move /Y "{caminho_novo_exe}" "{exe_atual}" >NUL\n'
+      "set tentativas=0\n"
+      ":mover\n"
+      f'move /Y "{caminho_novo_exe}" "{exe_atual}" >NUL 2>&1\n'
+      "if errorlevel 1 (\n"
+      "    set /a tentativas+=1\n"
+      "    if %tentativas% GEQ 60 (\n"
+      "        echo Nao foi possivel substituir o executavel (arquivo"
+      " ainda em uso ou bloqueado pelo antivirus).\n"
+      "        pause\n"
+      "        exit /b 1\n"
+      "    )\n"
+      "    timeout /t 1 /nobreak >NUL\n"
+      "    goto mover\n"
+      ")\n"
       f'start "" "{exe_atual}"\n'
       "exit\n"
   )
