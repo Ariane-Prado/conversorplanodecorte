@@ -100,6 +100,17 @@ def renomear_funcao(funcao_original: str) -> str:
     return "Lateral de Gaveta"
   if f.lower().startswith("base"):
     return "Base"
+  if f.lower().startswith("divis"):
+    return "Divisória"
+  primeira_palavra = f.split()[0].lower() if f.split() else ""
+  if primeira_palavra in ("chapeu", "chapéu", "tampo"):
+    return "Tampo"
+  if f.startswith("Lateral"):
+    tokens = f.split()
+    if "Dir" in tokens or "Direita" in tokens:
+      return "Lateral Direita"
+    if "Esq" in tokens or "Esquerda" in tokens:
+      return "Lateral Esquerda"
   return f
 
 

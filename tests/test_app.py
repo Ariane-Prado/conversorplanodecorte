@@ -45,6 +45,32 @@ class TestRenomearFuncao(unittest.TestCase):
     self.assertEqual(
         app.renomear_funcao("Lateral Direita Gaveta"), "Lateral de Gaveta"
     )
+    self.assertEqual(
+        app.renomear_funcao("Lateral Esquerda Gaveta"), "Lateral de Gaveta"
+    )
+
+  def test_laterais_de_movel_viram_direita_ou_esquerda(self):
+    for nome in ["Lateral Inf Dir", "Lateral Sup Dir", "Lateral Dir Dor"]:
+      self.assertEqual(app.renomear_funcao(nome), "Lateral Direita")
+    for nome in ["Lateral Inf Esq", "Lateral Sup Esq", "Lateral Esq Dor"]:
+      self.assertEqual(app.renomear_funcao(nome), "Lateral Esquerda")
+
+  def test_base_vira_base(self):
+    for nome in ["Base Inf", "Base Sup", "Base Dor", "Base Dir Canto Curvo"]:
+      self.assertEqual(app.renomear_funcao(nome), "Base")
+
+  def test_divisoria_vira_divisoria(self):
+    self.assertEqual(app.renomear_funcao("Divisória Vertical"), "Divisória")
+
+  def test_chapeu_e_tampo_viram_tampo(self):
+    for nome in ["Chapeu Sup", "Chapeu Dor", "Tampo Dir Canto Curvo"]:
+      self.assertEqual(app.renomear_funcao(nome), "Tampo")
+
+  def test_tamponamento_mantem_nome_original(self):
+    self.assertEqual(
+        app.renomear_funcao("Tamponamento 15mm c/ fita 1mm"),
+        "Tamponamento 15mm c/ fita 1mm",
+    )
 
   def test_nome_sem_regra_especial_fica_inalterado(self):
     self.assertEqual(app.renomear_funcao("Prateleira"), "Prateleira")
