@@ -515,7 +515,14 @@ def aplicar_atualizacao_e_reiniciar(caminho_novo_exe: str):
 
   Um .exe não pode se auto-sobrescrever enquanto roda, então isso grava um
   .bat que espera este processo terminar, move o arquivo novo por cima do
-  antigo, reabre o app e se autodestrói.
+  antigo e reabre o app.
+
+  A janela do .bat fica visível (com título e mensagem) e o script não se
+  autodestrói mais no final — um script oculto que troca um executável e
+  apaga a si mesmo é exatamente o padrão que antivírus/EDR costumam
+  bloquear por heurística de auto-replicação, mesmo sendo legítimo aqui.
+  O arquivo `_atualizar.bat` fica na pasta do app e é sobrescrito na
+  próxima atualização.
   """
   exe_atual = sys.executable
   pasta = os.path.dirname(exe_atual)
@@ -524,6 +531,8 @@ def aplicar_atualizacao_e_reiniciar(caminho_novo_exe: str):
 
   conteudo_bat = (
       "@echo off\n"
+      "title Atualizando Conversor XML Promob\n"
+      "echo Aplicando atualizacao, aguarde...\n"
       ":espera\n"
       f'tasklist /FI "PID eq {pid_atual}" 2>NUL | find /I "{pid_atual}" >NUL\n'
       "if not errorlevel 1 (\n"
@@ -532,16 +541,12 @@ def aplicar_atualizacao_e_reiniciar(caminho_novo_exe: str):
       ")\n"
       f'move /Y "{caminho_novo_exe}" "{exe_atual}" >NUL\n'
       f'start "" "{exe_atual}"\n'
-      'del "%~f0"\n'
+      "exit\n"
   )
   with open(bat_path, "w", encoding="utf-8") as f:
     f.write(conteudo_bat)
 
-  subprocess.Popen(
-      ["cmd", "/c", bat_path],
-      creationflags=subprocess.CREATE_NO_WINDOW,
-      close_fds=True,
-  )
+  subprocess.Popen(["cmd", "/c", bat_path], close_fds=True)
   os._exit(0)
 
 
