@@ -66,11 +66,21 @@ class TestRenomearFuncao(unittest.TestCase):
     for nome in ["Chapeu Sup", "Chapeu Dor", "Tampo Dir Canto Curvo"]:
       self.assertEqual(app.renomear_funcao(nome), "Tampo")
 
-  def test_tamponamento_mantem_nome_original(self):
+  def test_tamponamento_mantem_primeira_palavra(self):
     self.assertEqual(
-        app.renomear_funcao("Tamponamento 15mm c/ fita 1mm"),
-        "Tamponamento 15mm c/ fita 1mm",
+        app.renomear_funcao("Tamponamento 15mm c/ fita 1mm"), "Tamponamento"
     )
+    self.assertEqual(
+        app.renomear_funcao("Tamponamento 18mm c/ fita 2mm"), "Tamponamento"
+    )
+
+  def test_painel_com_sufixo_vira_painel(self):
+    self.assertEqual(app.renomear_funcao("Painel 15mm c/ fita 1mm"), "Painel")
+
+  def test_pecas_genericas_mantem_so_a_primeira_palavra(self):
+    self.assertEqual(app.renomear_funcao("Fundo Mod Sup"), "Fundo")
+    self.assertEqual(app.renomear_funcao("Prateleira Dormitorio"), "Prateleira")
+    self.assertEqual(app.renomear_funcao("Prateleira Furada"), "Prateleira")
 
   def test_nome_sem_regra_especial_fica_inalterado(self):
     self.assertEqual(app.renomear_funcao("Prateleira"), "Prateleira")

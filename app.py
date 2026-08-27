@@ -111,7 +111,11 @@ def renomear_funcao(funcao_original: str) -> str:
       return "Lateral Direita"
     if "Esq" in tokens or "Esquerda" in tokens:
       return "Lateral Esquerda"
-  return f
+  # Regra geral: qualquer peça sem regra específica acima mantém só a
+  # primeira palavra, removendo sufixos de módulo/lado/ambiente/espessura
+  # ("Fundo Mod Sup" -> "Fundo", "Painel 15mm c/ fita 1mm" -> "Painel").
+  # Peças que precisarem manter o sufixo entram como exceção explícita.
+  return f.split()[0] if f.split() else f
 
 
 def extrair_servicos_adicionais(item, desc_original: str) -> str:
