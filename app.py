@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import threading
+import unicodedata
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
@@ -14,11 +15,25 @@ import pandas as pd
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-# Configuração do tema visual da interface
-ctk.set_appearance_mode("System")
+# Configuração do tema visual da interface. Fixo em "dark": várias cores da
+# interface (cards, botões, inputs) já são hardcoded pensando em fundo
+# escuro — deixar em "System" fazia o contraste variar (e às vezes falhar)
+# dependendo do tema do Windows do usuário.
+ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-VERSAO_ATUAL = "1.1.0"
+# Paleta de contraste (WCAG AA) usada nos textos e inputs da interface.
+COR_TITULO = "#FFFFFF"
+COR_TEXTO_SECUNDARIO = "#E0E0E0"
+COR_VERDE_PRIMARIO = "#1e7e34"  # mais escuro que o #27ae60 original: texto
+# branco sobre esse verde passa de ~2.9:1 para ~5.1:1 de contraste (WCAG AA
+# exige 4.5:1 pra texto normal).
+COR_VERDE_PRIMARIO_HOVER = "#17692a"
+COR_FUNDO_INPUT = "#2B2B2B"
+COR_BORDA_INPUT = "#444444"
+COR_FOCO_INPUT = "#2980b9"
+
+VERSAO_ATUAL = "1.2.0"
 URL_VERSAO_REMOTA = (
     "https://raw.githubusercontent.com/Ariane-Prado/conversorplanodecorte"
     "/main/versao.json"
@@ -88,6 +103,88 @@ FAMILIAS_IGNORADAS = {
     "Acessorios",
     "Alumistar",
 }
+
+# Módulos curvos em L (identificados pela expressão "Canto L" em algum
+# ponto do nome do módulo — ex: "Mod. Inferior Canto L", "Mod. Canto L s/
+# Rod Dormitorio") podem precisar ser cortados numa máquina terceirizada,
+# que exige uma margem extra de medida. Quando terceirizado, soma-se essa
+# margem na largura e no comprimento das peças de Base, Tampo e Prateleira
+# do módulo. O usuário escolhe, por módulo, se a margem é de 50mm ou 100mm.
+OPCOES_MARGEM_TERCEIRIZACAO_MM = [50, 100]
+FUNCOES_AFETADAS_TERCEIRIZACAO = {"Base", "Tampo", "Prateleira"}
+
+# "L" como palavra isolada (não início de "Lavatório" etc.) logo após
+# "canto", com qualquer quantidade de espaço entre os dois.
+_PADRAO_MODULO_CANTO_L = re.compile(r"\bcanto\s*l\b")
+
+
+def _normalizar_texto(texto: str) -> str:
+  nfkd = unicodedata.normalize("NFKD", texto or "")
+  return "".join(c for c in nfkd if not unicodedata.combining(c)).strip().lower()
+
+
+def eh_modulo_canto_l(nome_modulo: str) -> bool:
+  return bool(_PADRAO_MODULO_CANTO_L.search(_normalizar_texto(nome_modulo)))
+
+
+def formatar_medida_mm(valor: float) -> str:
+  try:
+    v = float(valor)
+  except (TypeError, ValueError):
+    return "-"
+  return f"{int(v)}" if v.is_integer() else f"{v:.1f}"
+
+
+def _encontrar_item_ancestral(item, parent_map: dict):
+  """Retorna o <ITEM> ancestral mais próximo com DESCRIPTION (o módulo/caixa
+  que contém a peça), ou None se só houver uma CATEGORY como ancestral."""
+  curr = parent_map.get(item)
+  while curr is not None:
+    if curr.tag == "ITEM" and curr.attrib.get("DESCRIPTION", "").strip():
+      return curr
+    curr = parent_map.get(curr)
+  return None
+
+
+def listar_modulos_canto_l(xml_path: str) -> list:
+  """Retorna, na ordem de aparição, os módulos de canto em L (nome contendo
+  "Canto L") encontrados no XML, como dicts {"nome", "comprimento",
+  "largura"} — comprimento/largura são a medida do módulo (WIDTH/DEPTH do
+  próprio item), só como referência de tamanho para a decisão do usuário."""
+  tree = ET.parse(xml_path)
+  root = tree.getroot()
+  ambients_section = root.find("AMBIENTS")
+  items_source = (
+      ambients_section.findall(".//ITEM")
+      if ambients_section is not None
+      else root.findall(".//ITEM")
+  )
+  parent_map = {c: p for p in root.iter() for c in p}
+  vistos = set()
+  modulos = []
+  for item in items_source:
+    refs = extrair_referencias(item)
+    if deve_ignorar_item(item, refs):
+      continue
+    modulo_item = _encontrar_item_ancestral(item, parent_map)
+    if modulo_item is None:
+      continue
+    modulo_nome = modulo_item.attrib.get("DESCRIPTION", "").strip()
+    if not eh_modulo_canto_l(modulo_nome) or modulo_nome in vistos:
+      continue
+    vistos.add(modulo_nome)
+    try:
+      comprimento = float(modulo_item.attrib.get("WIDTH", "0"))
+    except ValueError:
+      comprimento = 0.0
+    try:
+      largura = float(modulo_item.attrib.get("DEPTH", "0"))
+    except ValueError:
+      largura = 0.0
+    modulos.append(
+        {"nome": modulo_nome, "comprimento": comprimento, "largura": largura}
+    )
+  return modulos
 
 
 def renomear_funcao(funcao_original: str) -> str:
@@ -448,6 +545,69 @@ def aplicar_atualizacao_e_reiniciar(caminho_novo_exe: str):
   os._exit(0)
 
 
+def criar_tooltip(widget, texto: str, wraplength: int = 260):
+  """Balão de texto simples que aparece ao passar o mouse sobre `widget` e
+  some ao tirar o mouse — usado pra manter labels de apoio fora da tela
+  (ex: ícone de info ao lado de um select, botões de ícone no cabeçalho)."""
+  estado = {"janela": None}
+
+  def mostrar(event=None):
+    if estado["janela"] is not None:
+      return
+    x = widget.winfo_rootx() + widget.winfo_width() // 2
+    y = widget.winfo_rooty() + widget.winfo_height() + 6
+    janela = tk.Toplevel(widget)
+    janela.wm_overrideredirect(True)
+    janela.wm_geometry(f"+{x}+{y}")
+    janela.attributes("-topmost", True)
+    tk.Label(
+        janela,
+        text=texto,
+        bg="#2c3e50",
+        fg="white",
+        font=("Arial", 10),
+        relief="solid",
+        bd=1,
+        padx=8,
+        pady=5,
+        wraplength=wraplength,
+        justify="left",
+    ).pack()
+    estado["janela"] = janela
+
+  def esconder(event=None):
+    janela = estado["janela"]
+    if janela is not None:
+      estado["janela"] = None
+      try:
+        janela.destroy()
+      except tk.TclError:
+        pass
+
+  widget.bind("<Enter>", mostrar, add="+")
+  widget.bind("<Leave>", esconder, add="+")
+  widget.bind("<Destroy>", esconder, add="+")
+
+
+def aplicar_estilo_input(entry: ctk.CTkEntry):
+  """Estilo padrão dos campos de texto editáveis: fundo escuro (#2B2B2B) e
+  borda neutra (#444444) em repouso, com a borda destacada na cor primária
+  ao ganhar foco — dá pra quem está digitando saber onde o cursor está."""
+  entry.configure(
+      fg_color=COR_FUNDO_INPUT, border_color=COR_BORDA_INPUT, border_width=1
+  )
+  entry.bind(
+      "<FocusIn>",
+      lambda e: entry.configure(border_color=COR_FOCO_INPUT, border_width=2),
+      add="+",
+  )
+  entry.bind(
+      "<FocusOut>",
+      lambda e: entry.configure(border_color=COR_BORDA_INPUT, border_width=1),
+      add="+",
+  )
+
+
 class DestaqueWidget:
   """Moldura colorida ao redor de um ou mais widgets reais da tela.
 
@@ -604,9 +764,8 @@ class TourGuiado:
             widget=lambda: ti.frame_recentes,
             titulo="📋 Histórico de Projetos",
             texto=(
-                "Seus projetos anteriores ficam aqui. Use"
-                " '✏️ Editar / Reutilizar' pra reabrir um deles sem"
-                " refazer tudo."
+                "Seus projetos anteriores ficam aqui. Use o botão"
+                " '[ Editar ]' pra reabrir um deles sem refazer tudo."
             ),
         ),
         dict(
@@ -661,7 +820,12 @@ class TourGuiado:
             tela="TelaConfiguracaoProjeto",
             widget=lambda: tc.btn_convert,
             titulo="🔍 Ir para a Revisão",
-            texto="Com tudo preenchido, clique aqui pra processar o XML e revisar.",
+            texto=(
+                "Com tudo preenchido, clique aqui pra processar o XML e"
+                " revisar. Se o projeto tiver módulos de Canto L, uma tela"
+                " extra pergunta, por módulo, se a peça fica na medida"
+                " original ou leva margem extra (+50mm/+100mm)."
+            ),
         ),
         dict(
             revisao=True,
@@ -670,7 +834,8 @@ class TourGuiado:
             texto=(
                 "Duplo-clique numa célula edita na hora (Enter confirma,"
                 " Esc cancela). Clique no cabeçalho de uma coluna pra"
-                " ordenar."
+                " ordenar. O ☐ no canto superior esquerdo da tabela marca"
+                " ou desmarca todas as linhas de uma vez."
             ),
         ),
         dict(
@@ -681,7 +846,8 @@ class TourGuiado:
             ],
             titulo="🗑️ Excluir e Desfazer",
             texto=(
-                "Selecione linhas e exclua da exportação. Errou? O botão"
+                "Marque uma ou mais linhas (clicando nelas ou usando o ☐ do"
+                " cabeçalho) e exclua da exportação. Errou? O botão"
                 " '↩️ Desfazer Exclusão' reverte a última exclusão."
             ),
         ),
@@ -717,8 +883,8 @@ class TourGuiado:
             widget=lambda: c.btn_ajuda,
             titulo="🎉 Pronto!",
             texto=(
-                "Isso é tudo! Reabra este tour quando quiser clicando aqui,"
-                " em '❓ Ajuda / Tutorial'."
+                "Isso é tudo! Reabra este tour quando quiser clicando neste"
+                " ❓ aqui em cima, no canto superior direito."
             ),
         ),
     ]
@@ -865,7 +1031,7 @@ class TourGuiado:
     card.protocol("WM_DELETE_WINDOW", self.fechar)
 
     self._lbl_progresso = ctk.CTkLabel(
-        card, text="", font=ctk.CTkFont(size=10), text_color="gray"
+        card, text="", font=ctk.CTkFont(size=10), text_color=COR_TEXTO_SECUNDARIO
     )
     self._lbl_progresso.pack(pady=(10, 0))
 
@@ -900,8 +1066,8 @@ class TourGuiado:
         frame_nav,
         text="Próximo ➔",
         width=110,
-        fg_color="#27ae60",
-        hover_color="#219150",
+        fg_color=COR_VERDE_PRIMARIO,
+        hover_color=COR_VERDE_PRIMARIO_HOVER,
         command=self._proximo,
     )
     self._btn_proximo.pack(side="right")
@@ -989,6 +1155,119 @@ class TourGuiado:
     salvar_config({"tutorial_visto": True})
 
 
+class JanelaModulosCantoL(ctk.CTkToplevel):
+  """Pergunta, para cada módulo de canto em L encontrado no XML, se a
+  peça mantém a medida original ou soma margem de 50/100mm nas peças de
+  Base, Tampo e Prateleira — margem usada quando a peça vai ser cortada
+  numa máquina que exige essa folga extra. Usa grid (não pack) pro botão
+  de confirmar ficar sempre visível, mesmo com muitos módulos na lista —
+  antes ele podia ficar escondido abaixo da borda da janela até
+  maximizar."""
+
+  OPCAO_SEM_MARGEM = "Medida Original"
+
+  def __init__(self, parent, modulos: list):
+    super().__init__(parent)
+    self.title("Módulos de Canto L")
+    self.geometry("640x500")
+    self.minsize(560, 380)
+    self.grab_set()
+
+    self.resultado = {}
+    self.vars_margem = {}
+
+    self.grid_columnconfigure(0, weight=1)
+    self.grid_rowconfigure(1, weight=1)
+
+    frame_topo = ctk.CTkFrame(self, fg_color="transparent")
+    frame_topo.grid(row=0, column=0, sticky="ew", padx=20, pady=(15, 5))
+
+    ctk.CTkLabel(
+        frame_topo,
+        text="📐 Módulos de Canto L encontrados",
+        font=ctk.CTkFont(size=16, weight="bold"),
+        text_color=COR_TITULO,
+        anchor="w",
+    ).pack(fill="x")
+
+    ctk.CTkLabel(
+        frame_topo,
+        text=(
+            "Módulos de canto L às vezes são cortados numa máquina que"
+            " exige margem extra na peça. Para cada módulo, escolha a"
+            " medida original (sem alteração) ou uma margem de"
+            " +50mm/+100mm, somada na largura e no comprimento das peças"
+            " de Base, Tampo e Prateleira."
+        ),
+        text_color=COR_TEXTO_SECUNDARIO,
+        font=ctk.CTkFont(size=12),
+        justify="left",
+        wraplength=580,
+        anchor="w",
+    ).pack(fill="x", pady=(6, 0))
+
+    frame_lista = ctk.CTkScrollableFrame(self)
+    frame_lista.grid(row=1, column=0, sticky="nsew", padx=20, pady=5)
+
+    self._opcoes_valores = {
+        f"+{mm}mm": mm for mm in OPCOES_MARGEM_TERCEIRIZACAO_MM
+    }
+    opcoes = [self.OPCAO_SEM_MARGEM] + list(self._opcoes_valores.keys())
+    for modulo in modulos:
+      nome = modulo["nome"]
+      linha = ctk.CTkFrame(frame_lista, fg_color="transparent")
+      linha.pack(fill="x", pady=8, padx=4)
+
+      ctk.CTkLabel(
+          linha,
+          text=nome,
+          font=ctk.CTkFont(size=13, weight="bold"),
+          anchor="w",
+      ).pack(fill="x")
+
+      medida = (
+          f"Medida do módulo: {formatar_medida_mm(modulo['comprimento'])} x"
+          f" {formatar_medida_mm(modulo['largura'])} mm"
+      )
+      ctk.CTkLabel(
+          linha,
+          text=medida,
+          text_color=COR_TEXTO_SECUNDARIO,
+          font=ctk.CTkFont(size=12),
+          anchor="w",
+      ).pack(fill="x", pady=(0, 6))
+
+      var = ctk.StringVar(value=self.OPCAO_SEM_MARGEM)
+      self.vars_margem[nome] = var
+      ctk.CTkSegmentedButton(
+          linha, values=opcoes, variable=var
+      ).pack(fill="x")
+
+    frame_rodape = ctk.CTkFrame(self, fg_color="transparent")
+    frame_rodape.grid(row=2, column=0, sticky="ew", padx=20, pady=15)
+
+    btn_confirmar = ctk.CTkButton(
+        frame_rodape,
+        text="✅ Confirmar",
+        command=self._confirmar,
+        fg_color=COR_VERDE_PRIMARIO,
+        hover_color=COR_VERDE_PRIMARIO_HOVER,
+        height=42,
+    )
+    btn_confirmar.pack(fill="x")
+
+    self.protocol("WM_DELETE_WINDOW", self._confirmar)
+
+  def _confirmar(self):
+    self.resultado = {
+        nome: self._opcoes_valores[var.get()]
+        for nome, var in self.vars_margem.items()
+        if var.get() in self._opcoes_valores
+    }
+    self.grab_release()
+    self.destroy()
+
+
 class JanelaRevisao(ctk.CTkToplevel):
 
   def __init__(
@@ -1015,12 +1294,31 @@ class JanelaRevisao(ctk.CTkToplevel):
     if iniciar_grab:
       self.grab_set()
 
+    self.frame_header = ctk.CTkFrame(self, fg_color="transparent")
+    self.frame_header.pack(pady=(12, 2), padx=20, fill="x")
+
     self.lbl_title = ctk.CTkLabel(
-        self,
-        text="✏️ Tela de Revisão dos Dados",
+        self.frame_header,
+        text="✏️ Revisão de Peças",
         font=ctk.CTkFont(size=18, weight="bold"),
+        text_color=COR_TITULO,
     )
-    self.lbl_title.pack(pady=(12, 2))
+    self.lbl_title.pack(side="left")
+
+    # Botão de ajuda discreto (ícone), fora do fluxo de ações principais.
+    self.btn_ajuda = ctk.CTkButton(
+        self.frame_header,
+        text="❓",
+        width=30,
+        height=30,
+        corner_radius=15,
+        fg_color="transparent",
+        text_color=COR_TEXTO_SECUNDARIO,
+        hover_color="#e5e8ea",
+        font=ctk.CTkFont(size=14, weight="bold"),
+        command=lambda: TourGuiado(self.parent.controller, janela_revisao=self),
+    )
+    self.btn_ajuda.pack(side="right")
 
     self.lbl_inst = ctk.CTkLabel(
         self,
@@ -1030,8 +1328,8 @@ class JanelaRevisao(ctk.CTkToplevel):
             " ordenar. Passe o mouse nos cabeçalhos para ver a instrução da"
             " coluna."
         ),
-        text_color="gray",
-        font=ctk.CTkFont(size=11),
+        text_color=COR_TEXTO_SECUNDARIO,
+        font=ctk.CTkFont(size=12),
     )
     self.lbl_inst.pack(pady=(0, 4))
 
@@ -1043,17 +1341,80 @@ class JanelaRevisao(ctk.CTkToplevel):
     )
     self.lbl_alerta_dim.pack(pady=(0, 6))
 
+    # Barra de ferramentas de manipulação da lista, acima da tabela (a
+    # seleção em massa fica no checkbox do cabeçalho da própria tabela).
+    self.frame_ferramentas = ctk.CTkFrame(self, fg_color="transparent")
+    self.frame_ferramentas.pack(pady=(0, 6), padx=20, fill="x")
+
+    self.btn_prox_excedente = ctk.CTkButton(
+        self.frame_ferramentas,
+        text="⚠️ Próxima Excedente",
+        fg_color="transparent",
+        text_color="#e67e22",
+        border_width=1,
+        border_color="#e67e22",
+        hover_color="#fdf1e6",
+        font=ctk.CTkFont(size=11),
+        height=28,
+        width=160,
+        command=self.ir_para_proxima_excedente,
+    )
+    self.btn_prox_excedente.pack(side="left", padx=(0, 5))
+
+    self.btn_excluir = ctk.CTkButton(
+        self.frame_ferramentas,
+        text="🗑️ Excluir Selecionadas",
+        fg_color="transparent",
+        text_color="#c0392b",
+        border_width=1,
+        border_color="#c0392b",
+        hover_color="#fbeae8",
+        font=ctk.CTkFont(size=11),
+        height=28,
+        width=170,
+        command=self.excluir_selecionadas,
+        state="disabled",
+    )
+    self.btn_excluir.pack(side="left", padx=5)
+
+    self.btn_desfazer = ctk.CTkButton(
+        self.frame_ferramentas,
+        text="↩️ Desfazer Exclusão",
+        fg_color="transparent",
+        text_color=COR_TEXTO_SECUNDARIO,
+        border_width=1,
+        border_color="#bdc3c7",
+        hover_color="#e5e8ea",
+        font=ctk.CTkFont(size=11),
+        height=28,
+        width=160,
+        command=self.desfazer_exclusao,
+        state="disabled",
+    )
+    self.btn_desfazer.pack(side="left", padx=5)
+
+    self.lbl_dica_selecao = ctk.CTkLabel(
+        self.frame_ferramentas,
+        text="☐ no canto da tabela marca/desmarca todas as linhas",
+        text_color=COR_TEXTO_SECUNDARIO,
+        font=ctk.CTkFont(size=12),
+    )
+    self.lbl_dica_selecao.pack(side="right")
+
     self.frame_tabla = ctk.CTkFrame(self)
     self.frame_tabla.pack(padx=15, pady=5, fill="both", expand=True)
 
     self.columns = list(self.df.columns)
     self.tree = ttk.Treeview(
-        self.frame_tabla, columns=self.columns, show="headings", height=15
+        self.frame_tabla,
+        columns=self.columns,
+        show="tree headings",
+        height=15,
     )
 
     style = ttk.Style()
     style.theme_use("clam")
-    style.configure("Treeview", rowheight=26, font=("Arial", 10))
+    style.configure("Treeview", rowheight=26, font=("Arial", 10), indent=0)
     style.configure(
         "Treeview.Heading", font=("Arial", 10, "bold"), background="#34495e"
     )
@@ -1064,6 +1425,13 @@ class JanelaRevisao(ctk.CTkToplevel):
 
     self._coluna_ordenada = None
     self._ordem_crescente = True
+
+    # Coluna implícita "#0": usada só como checkbox de seleção em massa no
+    # cabeçalho (marca/desmarca todas as linhas), sem editor de célula.
+    self.tree.heading(
+        "#0", text="☐", command=self._alternar_checkbox_cabecalho
+    )
+    self.tree.column("#0", width=34, minwidth=34, stretch=False, anchor="center")
 
     for col in self.columns:
       self.tree.heading(
@@ -1107,8 +1475,11 @@ class JanelaRevisao(ctk.CTkToplevel):
     self._editor_inline = None
     self._ultima_exclusao = None
 
+    # Rodapé: reservado só para o resumo de status e o fechamento do
+    # formulário (cancelar / destino de salvamento / confirmar). Nenhuma
+    # ação de manipulação da lista fica aqui.
     self.frame_status = ctk.CTkFrame(self, fg_color="transparent")
-    self.frame_status.pack(pady=(2, 0), padx=20, fill="x")
+    self.frame_status.pack(pady=(6, 0), padx=20, fill="x")
 
     self.lbl_total_pecas = ctk.CTkLabel(
         self.frame_status,
@@ -1125,105 +1496,36 @@ class JanelaRevisao(ctk.CTkToplevel):
     )
     self.lbl_selecionadas.pack(side="right")
 
-    self.frame_ferramentas = ctk.CTkFrame(self, fg_color="transparent")
-    self.frame_ferramentas.pack(pady=(6, 0), padx=20, fill="x")
-
-    self.btn_selecionar_todas = ctk.CTkButton(
-        self.frame_ferramentas,
-        text="Selecionar Todas",
-        fg_color="#7f8c8d",
-        hover_color="#95a5a6",
-        font=ctk.CTkFont(size=11),
-        height=28,
-        width=130,
-        command=self.selecionar_todas,
-    )
-    self.btn_selecionar_todas.pack(side="left", padx=(0, 5))
-
-    self.btn_limpar_selecao = ctk.CTkButton(
-        self.frame_ferramentas,
-        text="Limpar Seleção",
-        fg_color="#7f8c8d",
-        hover_color="#95a5a6",
-        font=ctk.CTkFont(size=11),
-        height=28,
-        width=130,
-        command=self.limpar_selecao,
-    )
-    self.btn_limpar_selecao.pack(side="left", padx=5)
-
-    self.btn_prox_excedente = ctk.CTkButton(
-        self.frame_ferramentas,
-        text="⚠️ Próxima Excedente",
-        fg_color="#e67e22",
-        hover_color="#d35400",
-        font=ctk.CTkFont(size=11),
-        height=28,
-        width=160,
-        command=self.ir_para_proxima_excedente,
-    )
-    self.btn_prox_excedente.pack(side="left", padx=5)
-
-    self.btn_ajuda = ctk.CTkButton(
-        self.frame_ferramentas,
-        text="❓ Ajuda",
-        fg_color="#8e44ad",
-        hover_color="#9b59b6",
-        font=ctk.CTkFont(size=11),
-        height=28,
-        width=90,
-        command=lambda: TourGuiado(self.parent.controller, janela_revisao=self),
-    )
-    self.btn_ajuda.pack(side="right")
-
     self.carregar_dados_tree()
 
     self.frame_btns = ctk.CTkFrame(self, fg_color="transparent")
     self.frame_btns.pack(pady=12, padx=20, fill="x")
 
+    # Estilo discreto (texto puro) para não competir com a ação primária.
     self.btn_cancelar = ctk.CTkButton(
         self.frame_btns,
         text="Cancelar",
-        fg_color="#e74c3c",
-        hover_color="#c0392b",
+        fg_color="transparent",
+        text_color=COR_TEXTO_SECUNDARIO,
+        hover_color="#e5e8ea",
         command=self.destroy,
-        width=110,
+        width=100,
     )
     self.btn_cancelar.pack(side="left", padx=5)
 
-    self.btn_excluir = ctk.CTkButton(
-      self.frame_btns,
-      text="Excluir selecionadas",
-      fg_color="#c0392b",
-      hover_color="#a93226",
-      command=self.excluir_selecionadas,
-      width=150,
-    )
-    self.btn_excluir.pack(side="left", padx=5)
-
-    self.btn_desfazer = ctk.CTkButton(
-        self.frame_btns,
-        text="↩️ Desfazer Exclusão",
-        fg_color="#7f8c8d",
-        hover_color="#95a5a6",
-        command=self.desfazer_exclusao,
-        width=160,
-        state="disabled",
-    )
-    self.btn_desfazer.pack(side="left", padx=5)
-
-    # Seleção de fábrica(s) para salvar simultaneamente. Só ficam disponíveis
-    # as fábricas que usam o mesmo layout de colunas que já está em revisão
-    # (TMKCloud tem um layout próprio, então aparece sozinho nesse caso).
-    self.frame_sel_forn = ctk.CTkFrame(self.frame_btns, fg_color="transparent")
-    self.frame_sel_forn.pack(side="left", expand=True)
+    # Seleção de fábrica(s) para salvar simultaneamente, como chips dentro
+    # de um contêiner próprio. Só ficam disponíveis as fábricas que usam o
+    # mesmo layout de colunas que já está em revisão (TMKCloud tem um
+    # layout próprio, então aparece sozinho nesse caso).
+    self.frame_sel_forn = ctk.CTkFrame(self.frame_btns, corner_radius=8)
+    self.frame_sel_forn.pack(side="left", expand=True, padx=10)
 
     self.lbl_forn_escolha = ctk.CTkLabel(
         self.frame_sel_forn,
         text="💾 Salvar para:",
         font=ctk.CTkFont(size=12, weight="bold"),
     )
-    self.lbl_forn_escolha.pack(side="left", padx=(5, 8))
+    self.lbl_forn_escolha.pack(side="left", padx=(10, 8), pady=8)
 
     grupo_compativel = (
         FORNECEDORES_FORMATO_TMK
@@ -1231,24 +1533,28 @@ class JanelaRevisao(ctk.CTkToplevel):
         else FORNECEDORES_FORMATO_PADRAO
     )
     self.fornecedores_vars = {}
+    self.fornecedores_chips = {}
     for nome_forn in grupo_compativel:
-      var = ctk.BooleanVar(value=(nome_forn == fornecedor_atual))
-      chk = ctk.CTkCheckBox(
+      selecionado = nome_forn == fornecedor_atual
+      self.fornecedores_vars[nome_forn] = selecionado
+      chip = ctk.CTkButton(
           self.frame_sel_forn,
           text=nome_forn,
-          variable=var,
-          font=ctk.CTkFont(size=11),
-          checkbox_width=18,
-          checkbox_height=18,
+          corner_radius=14,
+          height=26,
+          width=104,
+          font=ctk.CTkFont(size=11, weight="bold"),
+          command=lambda n=nome_forn: self._alternar_chip_fornecedor(n),
       )
-      chk.pack(side="left", padx=4)
-      self.fornecedores_vars[nome_forn] = var
+      self._estilizar_chip_fornecedor(chip, selecionado)
+      chip.pack(side="left", padx=4, pady=8)
+      self.fornecedores_chips[nome_forn] = chip
 
     self.btn_confirmar = ctk.CTkButton(
         self.frame_btns,
         text="✅ Confirmar e Salvar",
-        fg_color="#27ae60",
-        hover_color="#219150",
+        fg_color=COR_VERDE_PRIMARIO,
+        hover_color=COR_VERDE_PRIMARIO_HOVER,
         font=ctk.CTkFont(size=13, weight="bold"),
         command=self.confirmar_e_salvar,
         height=40,
@@ -1271,7 +1577,7 @@ class JanelaRevisao(ctk.CTkToplevel):
       except (ValueError, TypeError, IndexError):
         pass
     self.lbl_total_pecas.configure(
-        text=f"📦 Total de peças: {total_pecas}  ({len(linhas)} linha(s))"
+        text=f"📦 Total de peças: {total_pecas}  •  {len(linhas)} linha(s)"
     )
 
   def atualizar_contagem_selecionadas(self, event=None):
@@ -1290,6 +1596,45 @@ class JanelaRevisao(ctk.CTkToplevel):
       )
     else:
       self.lbl_selecionadas.configure(text="")
+
+    self.btn_excluir.configure(state="normal" if selecionadas else "disabled")
+    self._atualizar_glifo_checkbox_cabecalho()
+
+  def _atualizar_glifo_checkbox_cabecalho(self):
+    total = len(self.tree.get_children())
+    marcado = total > 0 and len(self.tree.selection()) == total
+    self.tree.heading("#0", text="☑" if marcado else "☐")
+
+  def _alternar_checkbox_cabecalho(self):
+    total = self.tree.get_children()
+    if total and len(self.tree.selection()) == len(total):
+      self.limpar_selecao()
+    else:
+      self.selecionar_todas()
+
+  def _estilizar_chip_fornecedor(self, chip, selecionado):
+    if selecionado:
+      chip.configure(
+          fg_color="#2980b9",
+          text_color="white",
+          hover_color="#3498db",
+          border_width=0,
+      )
+    else:
+      chip.configure(
+          fg_color="transparent",
+          text_color="#2980b9",
+          hover_color="#eaf2f8",
+          border_width=1,
+          border_color="#2980b9",
+      )
+
+  def _alternar_chip_fornecedor(self, nome_forn):
+    novo_estado = not self.fornecedores_vars[nome_forn]
+    self.fornecedores_vars[nome_forn] = novo_estado
+    self._estilizar_chip_fornecedor(
+        self.fornecedores_chips[nome_forn], novo_estado
+    )
 
   def _alternar_selecao_linha(self, event):
     if self.tree.identify("region", event.x, event.y) not in ("cell", "tree"):
@@ -1406,9 +1751,15 @@ class JanelaRevisao(ctk.CTkToplevel):
     region = self.tree.identify("region", event.x, event.y)
     if region == "heading":
       col_id = self.tree.identify_column(event.x)
-      col_idx = int(col_id.replace("#", "")) - 1
-      col_nome = self.columns[col_idx]
-      dica = DICAS_COLUNAS.get(col_nome, "Clique para editar os dados")
+      if col_id == "#0":
+        col_label = "Selecionar tudo"
+        dica = "Marca ou desmarca todas as linhas da tabela"
+      else:
+        col_idx = int(col_id.replace("#", "")) - 1
+        col_label = self.columns[col_idx].replace(chr(10), " ")
+        dica = DICAS_COLUNAS.get(
+            self.columns[col_idx], "Clique para editar os dados"
+        )
 
       if self.tooltip_label is None:
         self.tooltip_label = tk.Label(
@@ -1425,7 +1776,7 @@ class JanelaRevisao(ctk.CTkToplevel):
 
       x_pos = self.winfo_pointerx() - self.winfo_rootx() + 15
       y_pos = self.winfo_pointery() - self.winfo_rooty() + 15
-      self.tooltip_label.config(text=f"{col_nome.replace(chr(10), ' ')}: {dica}")
+      self.tooltip_label.config(text=f"{col_label}: {dica}")
       self.tooltip_label.place(x=x_pos, y=y_pos)
       self.tooltip_label.lift()
     else:
@@ -1570,7 +1921,7 @@ class JanelaRevisao(ctk.CTkToplevel):
       return
 
     fornecedores_selecionados = [
-        nome for nome, var in self.fornecedores_vars.items() if var.get()
+        nome for nome, selecionado in self.fornecedores_vars.items() if selecionado
     ]
     if not fornecedores_selecionados:
       messagebox.showwarning(
@@ -1606,29 +1957,42 @@ class ConversorXmlExcelApp(ctk.CTk):
     self.frame_topo = ctk.CTkFrame(self, fg_color="transparent")
     self.frame_topo.pack(side="top", fill="x", padx=15, pady=(8, 0))
 
+    # Botões-ícone com contorno visível: ajuda e verificação de atualização
+    # não são ações do fluxo principal, mas precisam se ler como botões
+    # clicáveis mesmo discretos — daí a borda e o ícone bem contrastado.
     self.btn_ajuda = ctk.CTkButton(
         self.frame_topo,
-        text="❓ Ajuda / Tutorial",
-        width=150,
-        height=30,
-        fg_color="#8e44ad",
-        hover_color="#9b59b6",
-        font=ctk.CTkFont(size=12, weight="bold"),
+        text="❓",
+        width=34,
+        height=34,
+        corner_radius=17,
+        fg_color="transparent",
+        text_color=COR_TEXTO_SECUNDARIO,
+        border_width=1,
+        border_color=COR_BORDA_INPUT,
+        hover_color="#3a3f44",
+        font=ctk.CTkFont(size=15, weight="bold"),
         command=self.abrir_tutorial,
     )
     self.btn_ajuda.pack(side="right")
+    criar_tooltip(self.btn_ajuda, "Tutorial e Ajuda")
 
     self.btn_verificar_update = ctk.CTkButton(
         self.frame_topo,
-        text="🔄 Verificar Atualizações",
-        width=180,
-        height=30,
-        fg_color="#2980b9",
-        hover_color="#3498db",
-        font=ctk.CTkFont(size=12, weight="bold"),
+        text="🔄",
+        width=34,
+        height=34,
+        corner_radius=17,
+        fg_color="transparent",
+        text_color=COR_TEXTO_SECUNDARIO,
+        border_width=1,
+        border_color=COR_BORDA_INPUT,
+        hover_color="#3a3f44",
+        font=ctk.CTkFont(size=15, weight="bold"),
         command=self.verificar_atualizacoes_manual,
     )
     self.btn_verificar_update.pack(side="right", padx=(0, 8))
+    criar_tooltip(self.btn_verificar_update, "Verificar atualizações")
 
     self.container = ctk.CTkFrame(self, fg_color="transparent")
     self.container.pack(fill="both", expand=True, padx=10, pady=10)
@@ -1639,7 +2003,7 @@ class ConversorXmlExcelApp(ctk.CTk):
         self,
         text=f"Desenvolvido por Ariane Prado · v{VERSAO_ATUAL}",
         font=ctk.CTkFont(size=11, weight="bold"),
-        text_color="gray",
+        text_color=COR_TEXTO_SECUNDARIO,
     )
     self.lbl_footer.pack(side="bottom", pady=6)
 
@@ -1678,9 +2042,7 @@ class ConversorXmlExcelApp(ctk.CTk):
     threading.Thread(target=worker, daemon=True).start()
 
   def verificar_atualizacoes_manual(self):
-    self.btn_verificar_update.configure(
-        state="disabled", text="🔄 Verificando..."
-    )
+    self.btn_verificar_update.configure(state="disabled", text="⏳")
 
     def worker():
       resultado = verificar_nova_versao()
@@ -1689,9 +2051,7 @@ class ConversorXmlExcelApp(ctk.CTk):
     threading.Thread(target=worker, daemon=True).start()
 
   def _resultado_verificacao_manual(self, resultado):
-    self.btn_verificar_update.configure(
-        state="normal", text="🔄 Verificar Atualizações"
-    )
+    self.btn_verificar_update.configure(state="normal", text="🔄")
     if resultado:
       self._notificar_nova_versao(*resultado)
     else:
@@ -1739,7 +2099,7 @@ class ConversorXmlExcelApp(ctk.CTk):
     barra.set(0)
 
     lbl_pct = ctk.CTkLabel(
-        janela, text="0%", font=ctk.CTkFont(size=11), text_color="gray"
+        janela, text="0%", font=ctk.CTkFont(size=11), text_color=COR_TEXTO_SECUNDARIO
     )
     lbl_pct.pack()
 
@@ -1831,17 +2191,15 @@ class TelaInicio(ctk.CTkFrame):
         self,
         text="Conversor de XML Promob / Start KNR",
         font=ctk.CTkFont(size=24, weight="bold"),
+        text_color=COR_TITULO,
     )
     self.lbl_title.pack(pady=(20, 2))
 
     self.lbl_sub = ctk.CTkLabel(
         self,
-        text=(
-            "Sistema de conversão automatizada de arquivos XML para planos de"
-            " corte."
-        ),
+        text="Gere planos de corte prontos pra fábrica a partir do XML.",
         font=ctk.CTkFont(size=13),
-        text_color="gray",
+        text_color=COR_TEXTO_SECUNDARIO,
     )
     self.lbl_sub.pack(pady=(0, 10))
 
@@ -1849,8 +2207,8 @@ class TelaInicio(ctk.CTkFrame):
         self,
         text="➕ Criar Novo Projeto",
         font=ctk.CTkFont(size=16, weight="bold"),
-        fg_color="#27ae60",
-        hover_color="#219150",
+        fg_color=COR_VERDE_PRIMARIO,
+        hover_color=COR_VERDE_PRIMARIO_HOVER,
         height=48,
         width=320,
         command=self.criar_novo_projeto,
@@ -1864,24 +2222,53 @@ class TelaInicio(ctk.CTkFrame):
 
     self.lbl_recentes_title = ctk.CTkLabel(
         self.frame_recentes,
-        text="📋 Projetos Anteriores & Histórico de Clientes",
+        text="📋 Histórico de Projetos",
         font=ctk.CTkFont(size=14, weight="bold"),
+        text_color=COR_TITULO,
         anchor="w",
     )
     self.lbl_recentes_title.pack(padx=15, pady=(10, 5), fill="x")
 
+    # Cabeçalho de colunas do "grid" de histórico — as linhas em si são
+    # montadas em atualizar_interface_historico(), usando grid() nesse
+    # mesmo frame rolável pra alinhar as 3 colunas com o cabeçalho.
+    self.frame_cabecalho_hist = ctk.CTkFrame(
+        self.frame_recentes, fg_color="transparent"
+    )
+    self.frame_cabecalho_hist.pack(padx=15, fill="x")
+    self.frame_cabecalho_hist.grid_columnconfigure(0, weight=3)
+    self.frame_cabecalho_hist.grid_columnconfigure(1, weight=1)
+    self.frame_cabecalho_hist.grid_columnconfigure(2, weight=0)
+
+    for col, texto in enumerate(["Projeto / Arquivo", "Formato", "Ações"]):
+      ctk.CTkLabel(
+          self.frame_cabecalho_hist,
+          text=texto,
+          font=ctk.CTkFont(size=11, weight="bold"),
+          text_color=COR_TEXTO_SECUNDARIO,
+          anchor="w",
+      ).grid(row=0, column=col, sticky="w", padx=6, pady=(2, 4))
+
     self.scroll_recentes = ctk.CTkScrollableFrame(self.frame_recentes)
     self.scroll_recentes.pack(padx=10, pady=(0, 10), fill="both", expand=True)
+    self.scroll_recentes.grid_columnconfigure(0, weight=3)
+    self.scroll_recentes.grid_columnconfigure(1, weight=1)
+    self.scroll_recentes.grid_columnconfigure(2, weight=0)
 
     self.frame_backup_inferior = ctk.CTkFrame(self, fg_color="transparent")
     self.frame_backup_inferior.pack(padx=20, pady=(5, 10), fill="x")
 
+    # Backup/restaurar são ações de manutenção, não do fluxo principal —
+    # estilo outlined pra não competir visualmente com "Criar Novo Projeto".
     self.btn_backup = ctk.CTkButton(
         self.frame_backup_inferior,
         text="☁️ Fazer Backup dos Dados",
         font=ctk.CTkFont(size=12, weight="bold"),
-        fg_color="#2980b9",
-        hover_color="#3498db",
+        fg_color="transparent",
+        text_color="#5dade2",
+        border_width=1,
+        border_color="#5dade2",
+        hover_color="#1b2631",
         height=38,
         command=self.fazer_backup,
     )
@@ -1891,8 +2278,11 @@ class TelaInicio(ctk.CTkFrame):
         self.frame_backup_inferior,
         text="📂 Restaurar Dados",
         font=ctk.CTkFont(size=12, weight="bold"),
-        fg_color="#8e44ad",
-        hover_color="#9b59b6",
+        fg_color="transparent",
+        text_color="#bb8fce",
+        border_width=1,
+        border_color="#bb8fce",
+        hover_color="#241b2b",
         height=38,
         command=self.restaurar_backup,
     )
@@ -1924,6 +2314,7 @@ class TelaInicio(ctk.CTkFrame):
           f"O arquivo XML original não foi encontrado em:\n{xml_antigo}\n\nPor"
           " favor, selecione o XML novamente.",
       )
+      self.atualizar_interface_historico()
       self.controller.show_frame("TelaConfiguracaoProjeto")
 
   def fazer_backup(self):
@@ -1984,58 +2375,99 @@ class TelaInicio(ctk.CTkFrame):
     for widget in self.scroll_recentes.winfo_children():
       widget.destroy()
 
-    historico = self.controller.historico
+    # Um projeto só entra na lista se o XML original e a pasta do Excel
+    # exportado ainda existirem — caso contrário "Abrir" e "Editar" não
+    # teriam como funcionar, então a linha só confundiria.
+    historico = [
+        item
+        for item in self.controller.historico
+        if os.path.exists(item.get("caminho_xml", ""))
+        and os.path.exists(os.path.dirname(item.get("caminho_excel", "")))
+    ]
     if not historico:
       lbl_vazio = ctk.CTkLabel(
           self.scroll_recentes,
           text="Nenhum projeto registrado no histórico.",
-          text_color="gray",
+          text_color=COR_TEXTO_SECUNDARIO,
       )
       lbl_vazio.pack(pady=20)
       return
 
-    for item in historico:
-      item_frame = ctk.CTkFrame(self.scroll_recentes, fg_color="transparent")
-      item_frame.pack(fill="x", pady=4, padx=5)
-
-      cli_str = f"[{item.get('cliente', 'Cliente')} - {item.get('ambiente', 'Ambiente')}]"
-      txt_label = f"📁 {cli_str} {item['nome_xml']} ➔ 📊 {os.path.basename(item['caminho_excel'])} ({item.get('fornecedor', 'Teletintas')})"
-      data_hora = item.get("data_hora", "")
-      if data_hora:
-        txt_label += f"  🕒 {data_hora}"
-
-      lbl_info = ctk.CTkLabel(
-          item_frame, text=txt_label, font=ctk.CTkFont(size=12), anchor="w"
+    for linha, item in enumerate(historico):
+      cli_str = f"{item.get('cliente', 'Cliente')} - {item.get('ambiente', 'Ambiente')}"
+      nomes_arquivo = (
+          f"📁 {item['nome_xml']}  ➔  📊"
+          f" {os.path.basename(item['caminho_excel'])}"
       )
-      lbl_info.pack(side="left", fill="x", expand=True)
+      data_hora = item.get("data_hora", "")
+
+      frame_projeto = ctk.CTkFrame(self.scroll_recentes, fg_color="transparent")
+      frame_projeto.grid(row=linha, column=0, sticky="ew", padx=6, pady=6)
+
+      ctk.CTkLabel(
+          frame_projeto,
+          text=cli_str,
+          font=ctk.CTkFont(size=12, weight="bold"),
+          text_color=COR_TITULO,
+          anchor="w",
+      ).pack(fill="x")
+      ctk.CTkLabel(
+          frame_projeto,
+          text=nomes_arquivo + (f"   🕒 {data_hora}" if data_hora else ""),
+          font=ctk.CTkFont(size=11),
+          text_color=COR_TEXTO_SECUNDARIO,
+          anchor="w",
+      ).pack(fill="x")
+
+      ctk.CTkLabel(
+          self.scroll_recentes,
+          text=item.get("fornecedor", "Teletintas"),
+          font=ctk.CTkFont(size=11),
+          text_color=COR_TEXTO_SECUNDARIO,
+          anchor="w",
+      ).grid(row=linha, column=1, sticky="w", padx=6, pady=6)
+
+      frame_acoes = ctk.CTkFrame(self.scroll_recentes, fg_color="transparent")
+      frame_acoes.grid(row=linha, column=2, sticky="e", padx=6, pady=6)
 
       caminho_pasta = os.path.dirname(item["caminho_excel"])
 
       btn_abrir_pasta = ctk.CTkButton(
-          item_frame,
-          text="Abrir Pasta",
-          width=85,
+          frame_acoes,
+          text="[ Abrir ]",
+          width=80,
           height=26,
           font=ctk.CTkFont(size=11),
           fg_color="#4b6584",
           hover_color="#3867d6",
-          command=lambda p=caminho_pasta: os.startfile(p)
-          if os.name == "nt"
-          else os.system(f'open "{p}"'),
+          command=lambda p=caminho_pasta: self._abrir_pasta_projeto(p),
       )
-      btn_abrir_pasta.pack(side="right", padx=4)
+      btn_abrir_pasta.pack(side="left", padx=(0, 4))
 
       btn_editar = ctk.CTkButton(
-          item_frame,
-          text="✏️ Editar / Reutilizar",
-          width=120,
+          frame_acoes,
+          text="[ Editar ]",
+          width=80,
           height=26,
           font=ctk.CTkFont(size=11),
           fg_color="#2980b9",
           hover_color="#3498db",
           command=lambda it=item: self.editar_projeto_historico(it),
       )
-      btn_editar.pack(side="right", padx=4)
+      btn_editar.pack(side="left")
+
+  def _abrir_pasta_projeto(self, caminho_pasta):
+    if not os.path.exists(caminho_pasta):
+      messagebox.showwarning(
+          "Pasta não encontrada",
+          f"A pasta do projeto não foi encontrada:\n{caminho_pasta}",
+      )
+      self.atualizar_interface_historico()
+      return
+    if os.name == "nt":
+      os.startfile(caminho_pasta)
+    else:
+      os.system(f'open "{caminho_pasta}"')
 
 
 class TelaNovoProjeto(ctk.CTkFrame):
@@ -2048,13 +2480,14 @@ class TelaNovoProjeto(ctk.CTkFrame):
         self,
         text="📝 Cadastro do Projeto",
         font=ctk.CTkFont(size=20, weight="bold"),
+        text_color=COR_TITULO,
     )
     self.lbl_title.pack(pady=(30, 5))
 
     self.lbl_sub = ctk.CTkLabel(
         self,
         text="Confirme ou altere o nome do cliente e do ambiente.",
-        text_color="gray",
+        text_color=COR_TEXTO_SECUNDARIO,
     )
     self.lbl_sub.pack(pady=(0, 25))
 
@@ -2075,6 +2508,7 @@ class TelaNovoProjeto(ctk.CTkFrame):
         font=ctk.CTkFont(size=13),
     )
     self.ent_cliente.pack(fill="x", padx=20, pady=(0, 15))
+    aplicar_estilo_input(self.ent_cliente)
 
     self.lbl_ambiente = ctk.CTkLabel(
         self.frame_form,
@@ -2090,6 +2524,7 @@ class TelaNovoProjeto(ctk.CTkFrame):
         font=ctk.CTkFont(size=13),
     )
     self.ent_ambiente.pack(fill="x", padx=20, pady=(0, 25))
+    aplicar_estilo_input(self.ent_ambiente)
 
     self.frame_nav = ctk.CTkFrame(self, fg_color="transparent")
     self.frame_nav.pack(pady=25, fill="x", padx=30)
@@ -2099,8 +2534,11 @@ class TelaNovoProjeto(ctk.CTkFrame):
         text="⬅️ Voltar",
         width=120,
         height=42,
-        fg_color="#7f8c8d",
-        hover_color="#95a5a6",
+        fg_color="transparent",
+        text_color=COR_TEXTO_SECUNDARIO,
+        border_width=1,
+        border_color=COR_BORDA_INPUT,
+        hover_color="#333333",
         command=lambda: controller.show_frame("TelaInicio"),
     )
     self.btn_voltar.pack(side="left")
@@ -2144,46 +2582,96 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
     super().__init__(parent, fg_color="transparent")
     self.controller = controller
 
+    # Card de contexto: cliente/ambiente + edição, num único elemento.
     self.frame_header_info = ctk.CTkFrame(self, fg_color="#2c3e50")
     self.frame_header_info.pack(padx=20, pady=(10, 15), fill="x")
 
-    self.lbl_info_header = ctk.CTkLabel(
+    # Rótulos ("Cliente:", "Ambiente:", a barra divisória) em negrito; os
+    # valores em si (nome do cliente/ambiente) em peso regular — precisa de
+    # labels separados porque um único CTkLabel não mistura pesos de fonte.
+    self.frame_info_texto = ctk.CTkFrame(
+        self.frame_header_info, fg_color="transparent"
+    )
+    self.frame_info_texto.pack(side="left", padx=15, pady=12)
+
+    fonte_rotulo = ctk.CTkFont(size=14, weight="bold")
+    fonte_valor = ctk.CTkFont(size=14, weight="normal")
+
+    ctk.CTkLabel(
+        self.frame_info_texto, text="Cliente:", font=fonte_rotulo,
+        text_color=COR_TITULO,
+    ).pack(side="left")
+    self.lbl_cliente_valor = ctk.CTkLabel(
+        self.frame_info_texto, text="-", font=fonte_valor,
+        text_color=COR_TITULO,
+    )
+    self.lbl_cliente_valor.pack(side="left", padx=(4, 12))
+    ctk.CTkLabel(
+        self.frame_info_texto, text="|", font=fonte_rotulo,
+        text_color=COR_TITULO,
+    ).pack(side="left", padx=(0, 12))
+    ctk.CTkLabel(
+        self.frame_info_texto, text="Ambiente:", font=fonte_rotulo,
+        text_color=COR_TITULO,
+    ).pack(side="left")
+    self.lbl_ambiente_valor = ctk.CTkLabel(
+        self.frame_info_texto, text="-", font=fonte_valor,
+        text_color=COR_TITULO,
+    )
+    self.lbl_ambiente_valor.pack(side="left", padx=(4, 0))
+
+    self.btn_editar_cad = ctk.CTkButton(
         self.frame_header_info,
-        text="👤 Cliente: -   |   🏠 Ambiente: -",
-        font=ctk.CTkFont(size=14, weight="bold"),
-        text_color="white",
-    )
-    self.lbl_info_header.pack(pady=12, padx=15)
-
-    self.frame_xml = ctk.CTkFrame(self)
-    self.frame_xml.pack(padx=20, pady=6, fill="x")
-
-    self.btn_select_xml = ctk.CTkButton(
-        self.frame_xml,
-        text="1. Selecionar XML",
-        command=self.selecionar_xml,
-        width=170,
-        height=38,
+        text="Editar",
+        width=70,
+        height=34,
+        corner_radius=17,
+        fg_color="transparent",
+        text_color=COR_TITULO,
+        border_width=1,
+        border_color="#5c6f80",
+        hover_color="#34495e",
         font=ctk.CTkFont(size=13, weight="bold"),
+        command=lambda: controller.show_frame("TelaNovoProjeto"),
     )
-    self.btn_select_xml.pack(side="left", padx=12, pady=10)
+    self.btn_editar_cad.pack(side="right", padx=12, pady=8)
+    criar_tooltip(self.btn_editar_cad, "Alterar Cliente / Ambiente")
 
-    self.lbl_xml_status = ctk.CTkLabel(
-        self.frame_xml, text="Nenhum arquivo XML selecionado", anchor="w"
+    # Passo 1: XML — campo padronizado (entrada somente-leitura + botão).
+    self.ent_xml_path = self._criar_campo_arquivo(
+        "1. Arquivo XML", "Procurar...", self.selecionar_xml
     )
-    self.lbl_xml_status.pack(
-        side="left", padx=10, pady=10, fill="x", expand=True
-    )
+    self.btn_select_xml = self.ent_xml_path.botao_associado
 
+    # Passo 2: Fábrica — a explicação de compatibilidade vira um ícone de
+    # info ao lado do label, em vez de um parágrafo cinza sempre visível.
     self.frame_forn = ctk.CTkFrame(self)
     self.frame_forn.pack(padx=20, pady=6, fill="x")
 
+    frame_forn_label = ctk.CTkFrame(self.frame_forn, fg_color="transparent")
+    frame_forn_label.pack(side="left", padx=(12, 4), pady=10)
+
     self.lbl_forn = ctk.CTkLabel(
-        self.frame_forn,
-        text="2. Formato Inicial de Fábrica:",
+        frame_forn_label,
+        text="2. Formato Inicial de Fábrica",
         font=ctk.CTkFont(size=13, weight="bold"),
     )
-    self.lbl_forn.pack(side="left", padx=12, pady=10)
+    self.lbl_forn.pack(side="left")
+
+    self.lbl_info_forn = ctk.CTkLabel(
+        frame_forn_label,
+        text="ⓘ",
+        font=ctk.CTkFont(size=14, weight="bold"),
+        text_color="#2980b9",
+        cursor="hand2",
+    )
+    self.lbl_info_forn.pack(side="left", padx=(6, 0))
+    criar_tooltip(
+        self.lbl_info_forn,
+        "Teletintas, Madefer, Tobias e TMKPlanilha usam a mesma planilha e"
+        " poderão ser marcadas juntas na revisão. TMKCloud usa um formato"
+        " de colunas próprio e fica disponível sozinha.",
+    )
 
     self.fornecedor_var = ctk.StringVar(value="Teletintas")
     self.cmb_fornecedor = ctk.CTkOptionMenu(
@@ -2195,43 +2683,16 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
     )
     self.cmb_fornecedor.pack(side="left", padx=10, pady=10)
 
-    self.lbl_forn_dica = ctk.CTkLabel(
-        self,
-        text=(
-            "💡 Teletintas, Madefer, Tobias e TMKPlanilha usam a mesma"
-            " planilha e poderão ser marcadas juntas na revisão. TMKCloud"
-            " usa um formato de colunas próprio e fica disponível sozinha."
-        ),
-        text_color="gray",
-        font=ctk.CTkFont(size=11),
-        justify="left",
-        wraplength=760,
-        anchor="w",
+    # Passo 3: pasta de destino — mesmo padrão de campo do passo 1 — com a
+    # opção de agrupar logo abaixo, coladas como um só grupo de decisão.
+    self.ent_pasta_destino = self._criar_campo_arquivo(
+        "3. Pasta de Destino", "Procurar...", self.selecionar_pasta_destino
     )
-    self.lbl_forn_dica.pack(padx=25, pady=(0, 8), fill="x")
-
-    self.frame_folder = ctk.CTkFrame(self)
-    self.frame_folder.pack(padx=20, pady=6, fill="x")
-
-    self.btn_select_folder = ctk.CTkButton(
-        self.frame_folder,
-        text="3. Escolher Onde Salvar",
-        command=self.selecionar_pasta_destino,
-        width=170,
-        height=38,
-        font=ctk.CTkFont(size=13, weight="bold"),
-        fg_color="#34495e",
-        hover_color="#2c3e50",
-    )
-    self.btn_select_folder.pack(side="left", padx=12, pady=10)
-
-    self.lbl_folder_status = ctk.CTkLabel(
-        self.frame_folder,
-        text="Salvar na mesma pasta do XML (Padrão)",
-        anchor="w",
-    )
-    self.lbl_folder_status.pack(
-        side="left", padx=10, pady=10, fill="x", expand=True
+    self.btn_select_folder = self.ent_pasta_destino.botao_associado
+    self._definir_texto_campo(
+        self.ent_pasta_destino,
+        "Salvar na mesma pasta do XML (Padrão)",
+        cor=COR_TEXTO_SECUNDARIO,
     )
 
     self.chk_agrupar_var = ctk.BooleanVar(value=False)
@@ -2241,62 +2702,118 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
         variable=self.chk_agrupar_var,
         font=ctk.CTkFont(size=12, weight="bold"),
     )
-    self.chk_agrupar.pack(pady=10, padx=25, anchor="w")
+    self.chk_agrupar.pack(pady=(2, 22), padx=25, anchor="w")
 
-    self.btn_convert = ctk.CTkButton(
-        self,
-        text="🔍 Revisar e Exportar para Excel",
-        command=self.iniciar_revisao,
-        fg_color="#27ae60",
-        hover_color="#219150",
-        height=50,
-        font=ctk.CTkFont(size=15, weight="bold"),
-        state="disabled",
-    )
-    self.btn_convert.pack(pady=15, padx=20, fill="x")
-
-    self.frame_botoes_nav = ctk.CTkFrame(self, fg_color="transparent")
-    self.frame_botoes_nav.pack(padx=20, pady=5, fill="x")
+    # Rodapé: só a navegação (Voltar, discreto) e a ação primária (verde).
+    self.frame_rodape = ctk.CTkFrame(self, fg_color="transparent")
+    self.frame_rodape.pack(padx=20, pady=(0, 15), fill="x")
 
     self.btn_voltar = ctk.CTkButton(
-        self.frame_botoes_nav,
+        self.frame_rodape,
         text="⬅️ Voltar",
         width=120,
-        height=36,
-        fg_color="#7f8c8d",
-        hover_color="#95a5a6",
+        height=42,
+        fg_color="transparent",
+        text_color=("gray20", "gray85"),
+        border_width=1,
+        border_color="#7f8c8d",
+        hover_color="#e5e8ea",
+        font=ctk.CTkFont(size=13, weight="bold"),
         command=lambda: controller.show_frame("TelaNovoProjeto"),
     )
     self.btn_voltar.pack(side="left")
 
-    self.btn_editar_cad = ctk.CTkButton(
-        self.frame_botoes_nav,
-        text="✏️ Alterar Cliente/Ambiente",
-        width=180,
-        height=36,
-        fg_color="#2980b9",
-        hover_color="#3498db",
-        command=lambda: controller.show_frame("TelaNovoProjeto"),
+    self.btn_convert = ctk.CTkButton(
+        self.frame_rodape,
+        text="Revisar e Exportar para Excel",
+        command=self.iniciar_revisao,
+        fg_color=COR_VERDE_PRIMARIO,
+        hover_color=COR_VERDE_PRIMARIO_HOVER,
+        # Sem isso, o CTk usa um cinza apagado (tema padrão) pro texto
+        # quando state="disabled", fazendo o botão parecer de outra cor.
+        text_color_disabled=COR_TITULO,
+        height=42,
+        font=ctk.CTkFont(size=14, weight="bold"),
+        state="disabled",
     )
-    self.btn_editar_cad.pack(side="right")
+    self.btn_convert.pack(side="left", fill="x", expand=True, padx=(12, 0))
+
+  def _criar_campo_arquivo(self, texto_passo, texto_botao, comando):
+    """Linha padrão pra escolha de arquivo/pasta: legenda + campo
+    somente-leitura mostrando o caminho atual + botão lateral pra trocar."""
+    frame = ctk.CTkFrame(self)
+    frame.pack(padx=20, pady=6, fill="x")
+
+    ctk.CTkLabel(
+        frame,
+        text=texto_passo,
+        font=ctk.CTkFont(size=12, weight="bold"),
+        text_color=COR_TEXTO_SECUNDARIO,
+        anchor="w",
+    ).pack(anchor="w", padx=12, pady=(10, 0))
+
+    frame_linha = ctk.CTkFrame(frame, fg_color="transparent")
+    frame_linha.pack(fill="x", padx=12, pady=(4, 10))
+
+    entrada = ctk.CTkEntry(frame_linha, state="disabled", height=36)
+    entrada.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+    botao = ctk.CTkButton(
+        frame_linha,
+        text=texto_botao,
+        command=comando,
+        width=120,
+        height=36,
+        fg_color="#34495e",
+        hover_color="#2c3e50",
+        font=ctk.CTkFont(size=12, weight="bold"),
+    )
+    botao.pack(side="left")
+    entrada.botao_associado = botao
+    return entrada
+
+  @staticmethod
+  def _definir_texto_campo(entrada, texto, cor=None):
+    entrada.configure(state="normal")
+    entrada.delete(0, "end")
+    entrada.insert(0, texto)
+    if cor is not None:
+      entrada.configure(text_color=cor)
+    entrada.configure(state="disabled")
 
   def ao_exibir_tela(self):
     cli = self.controller.cliente_nome or "Não informado"
     amb = self.controller.ambiente_nome or "Não informado"
-    self.lbl_info_header.configure(
-        text=f"👤 Cliente: {cli}   |   🏠 Ambiente: {amb}"
-    )
+    self.lbl_cliente_valor.configure(text=cli)
+    self.lbl_ambiente_valor.configure(text=amb)
     self.fornecedor_var.set(
         getattr(self.controller, "fornecedor_inicial", "Teletintas")
     )
 
     if self.controller.xml_path and os.path.exists(self.controller.xml_path):
       filename = os.path.basename(self.controller.xml_path)
-      self.lbl_xml_status.configure(text=f"📄 {filename}", text_color="#2980b9")
+      self._definir_texto_campo(self.ent_xml_path, f"📄 {filename}", cor="#2980b9")
+      self.ent_xml_path.botao_associado.configure(text="Alterar")
       self.btn_convert.configure(state="normal")
     else:
-      self.lbl_xml_status.configure(text="Nenhum arquivo XML selecionado")
+      self._definir_texto_campo(
+          self.ent_xml_path, "Nenhum arquivo XML selecionado", cor=COR_TEXTO_SECUNDARIO
+      )
+      self.ent_xml_path.botao_associado.configure(text="Procurar...")
       self.btn_convert.configure(state="disabled")
+
+    if self.controller.pasta_destino:
+      self._definir_texto_campo(
+          self.ent_pasta_destino, f"📁 {self.controller.pasta_destino}", cor=COR_TEXTO_SECUNDARIO
+      )
+      self.ent_pasta_destino.botao_associado.configure(text="Alterar")
+    else:
+      self._definir_texto_campo(
+          self.ent_pasta_destino,
+          "Salvar na mesma pasta do XML (Padrão)",
+          cor=COR_TEXTO_SECUNDARIO,
+      )
+      self.ent_pasta_destino.botao_associado.configure(text="Procurar...")
 
   def selecionar_xml(self):
     filepath = filedialog.askopenfilename(
@@ -2306,15 +2823,17 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
     if filepath:
       self.controller.xml_path = filepath
       filename = os.path.basename(filepath)
-      self.lbl_xml_status.configure(
-          text=f"📄 {filename}", text_color="#2980b9"
-      )
+      self._definir_texto_campo(self.ent_xml_path, f"📄 {filename}", cor="#2980b9")
+      self.ent_xml_path.botao_associado.configure(text="Alterar")
 
       if not self.controller.pasta_destino:
         self.controller.pasta_destino = os.path.dirname(filepath)
-        self.lbl_folder_status.configure(
-            text=f"📁 {self.controller.pasta_destino}", text_color="#7f8c8d"
+        self._definir_texto_campo(
+            self.ent_pasta_destino,
+            f"📁 {self.controller.pasta_destino}",
+            cor=COR_TEXTO_SECUNDARIO,
         )
+        self.ent_pasta_destino.botao_associado.configure(text="Alterar")
 
       cli_xml, amb_xml = extrair_cliente_ambiente_xml(filepath)
       if not self.controller.cliente_nome and cli_xml:
@@ -2324,9 +2843,8 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
 
       cli = self.controller.cliente_nome or "Não informado"
       amb = self.controller.ambiente_nome or "Não informado"
-      self.lbl_info_header.configure(
-          text=f"👤 Cliente: {cli}   |   🏠 Ambiente: {amb}"
-      )
+      self.lbl_cliente_valor.configure(text=cli)
+      self.lbl_ambiente_valor.configure(text=amb)
 
       self.btn_convert.configure(state="normal")
 
@@ -2336,13 +2854,15 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
     )
     if folderpath:
       self.controller.pasta_destino = folderpath
-      self.lbl_folder_status.configure(
-          text=f"📁 {folderpath}", text_color="#27ae60"
+      self._definir_texto_campo(
+          self.ent_pasta_destino, f"📁 {folderpath}", cor="#27ae60"
       )
+      self.ent_pasta_destino.botao_associado.configure(text="Alterar")
 
   def processar_dados_para_revisao(
-      self, xml_path, fornecedor_alvo="Teletintas"
+      self, xml_path, fornecedor_alvo="Teletintas", modulos_terceirizados=None
   ):
+    modulos_terceirizados = modulos_terceirizados or {}
     tree = ET.parse(xml_path)
     root = tree.getroot()
 
@@ -2382,10 +2902,17 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
       bl1 = refs.get("BL1", "")
       bl2 = refs.get("BL2", "")
 
+      comprimento = float(item.attrib.get("WIDTH", "0"))
+      largura = float(item.attrib.get("DEPTH", "0"))
+      margem_terceirizacao = modulos_terceirizados.get(modulo_nome, 0)
+      if margem_terceirizacao and funcao_formatada in FUNCOES_AFETADAS_TERCEIRIZACAO:
+        comprimento += margem_terceirizacao
+        largura += margem_terceirizacao
+
       row_p = {
           "Quantidade": int(float(item.attrib.get("QUANTITY", "1"))),
-          "Comprimento": float(item.attrib.get("WIDTH", "0")),
-          "Largura": float(item.attrib.get("DEPTH", "0")),
+          "Comprimento": comprimento,
+          "Largura": largura,
           "Função": funcao_formatada,
           "Fita C1": bc1,
           "Fita C2": bc2,
@@ -2417,8 +2944,8 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
       row_t = {
           "ITEM": item_num_tmk,
           "QUANT": int(float(item.attrib.get("QUANTITY", "1"))),
-          "COMP\n2750": float(item.attrib.get("WIDTH", "0")),
-          "LARG\n1840": float(item.attrib.get("DEPTH", "0")),
+          "COMP\n2750": comprimento,
+          "LARG\n1840": largura,
           "NOME DA PEÇA": funcao_formatada,
           "SERVIÇO ADICIONAIS": servico_adic,
           "AMBIENTE": nome_ambiente,
@@ -2535,6 +3062,17 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
       )
       return
 
+    modulos_terceirizados = {}
+    try:
+      modulos_canto_l = listar_modulos_canto_l(self.controller.xml_path)
+    except Exception:
+      modulos_canto_l = []
+
+    if modulos_canto_l:
+      janela_canto_l = JanelaModulosCantoL(self, modulos_canto_l)
+      self.wait_window(janela_canto_l)
+      modulos_terceirizados = janela_canto_l.resultado
+
     texto_original_btn = self.btn_convert.cget("text")
     self.btn_convert.configure(state="disabled", text="⏳ Processando XML...")
     self.update_idletasks()
@@ -2542,7 +3080,9 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
     try:
       forn_inicial = self.fornecedor_var.get().strip()
       df = self.processar_dados_para_revisao(
-          self.controller.xml_path, fornecedor_alvo=forn_inicial
+          self.controller.xml_path,
+          fornecedor_alvo=forn_inicial,
+          modulos_terceirizados=modulos_terceirizados,
       )
 
       if df.empty:
