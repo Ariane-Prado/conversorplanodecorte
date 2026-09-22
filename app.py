@@ -33,7 +33,7 @@ COR_FUNDO_INPUT = "#2B2B2B"
 COR_BORDA_INPUT = "#444444"
 COR_FOCO_INPUT = "#2980b9"
 
-VERSAO_ATUAL = "1.2.0"
+VERSAO_ATUAL = "1.2.1"
 URL_VERSAO_REMOTA = (
     "https://raw.githubusercontent.com/Ariane-Prado/conversorplanodecorte"
     "/main/versao.json"
@@ -86,10 +86,10 @@ FORNECEDORES_DISPONIVEIS = [
 ]
 
 # Fornecedores que compartilham a mesma estrutura de colunas (formato "padrão").
-# TMKCloud usa um layout de colunas próprio (ver processar_dados_para_revisao),
+# TMKPlanilha usa um layout de colunas próprio (ver processar_dados_para_revisao),
 # por isso fica de fora desse grupo.
-FORNECEDORES_FORMATO_PADRAO = ["Teletintas", "Madefer", "Tobias", "TMKPlanilha"]
-FORNECEDORES_FORMATO_TMK = ["TMKCloud"]
+FORNECEDORES_FORMATO_PADRAO = ["Teletintas", "Madefer", "Tobias", "TMKCloud"]
+FORNECEDORES_FORMATO_TMK = ["TMKPlanilha"]
 
 # Famílias de itens que não representam peças de MDF a serem cortadas
 # (ferragens, roteiros de montagem, ou linhas de parceiros como a Alumistar,
@@ -824,8 +824,8 @@ class TourGuiado:
             widget=lambda: tc.cmb_fornecedor,
             titulo="🏭 Escolher a Fábrica",
             texto=(
-                "Teletintas, Madefer, Tobias e TMKPlanilha usam o mesmo"
-                " layout de planilha. TMKCloud usa um formato próprio."
+                "Teletintas, Madefer, Tobias e TMKCloud usam o mesmo"
+                " layout de planilha. TMKPlanilha usa um formato próprio."
             ),
         ),
         dict(
@@ -1539,7 +1539,7 @@ class JanelaRevisao(ctk.CTkToplevel):
 
     # Seleção de fábrica(s) para salvar simultaneamente, como chips dentro
     # de um contêiner próprio. Só ficam disponíveis as fábricas que usam o
-    # mesmo layout de colunas que já está em revisão (TMKCloud tem um
+    # mesmo layout de colunas que já está em revisão (TMKPlanilha tem um
     # layout próprio, então aparece sozinho nesse caso).
     self.frame_sel_forn = ctk.CTkFrame(self.frame_btns, corner_radius=8)
     self.frame_sel_forn.pack(side="left", expand=True, padx=10)
@@ -2692,8 +2692,8 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
     self.lbl_info_forn.pack(side="left", padx=(6, 0))
     criar_tooltip(
         self.lbl_info_forn,
-        "Teletintas, Madefer, Tobias e TMKPlanilha usam a mesma planilha e"
-        " poderão ser marcadas juntas na revisão. TMKCloud usa um formato"
+        "Teletintas, Madefer, Tobias e TMKCloud usam a mesma planilha e"
+        " poderão ser marcadas juntas na revisão. TMKPlanilha usa um formato"
         " de colunas próprio e fica disponível sozinha.",
     )
 
@@ -2987,8 +2987,7 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
       rows_tmk.append(row_t)
       item_num_tmk += 1
 
-    # CORREÇÃO: "TMK" foi alterado para "TMKCloud" para ativar a lógica específica
-    if fornecedor_alvo == "TMKCloud":
+    if fornecedor_alvo == "TMKPlanilha":
       colunas_tmk = [
           "ITEM",
           "QUANT",
@@ -3032,8 +3031,7 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
           " agrupar as peças idênticas e somar suas quantidades?",
       )
       if resposta:
-        # CORREÇÃO: "TMK" alterado para "TMKCloud"
-        if fornecedor_alvo == "TMKCloud":
+        if fornecedor_alvo == "TMKPlanilha":
           cols_agrupar = [
               "COMP\n2750",
               "LARG\n1840",
@@ -3153,8 +3151,7 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
           if not substituir:
             continue
 
-        # CORREÇÃO: "TMK" alterado para "TMKCloud"
-        if fornecedor_escolhido == "TMKCloud":
+        if fornecedor_escolhido == "TMKPlanilha":
           wb = openpyxl.Workbook()
           ws = wb.active
           ws.title = "PREENCHA AQUI"
