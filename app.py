@@ -33,7 +33,7 @@ COR_FUNDO_INPUT = "#2B2B2B"
 COR_BORDA_INPUT = "#444444"
 COR_FOCO_INPUT = "#2980b9"
 
-VERSAO_ATUAL = "1.2.1"
+VERSAO_ATUAL = "1.2.2"
 URL_VERSAO_REMOTA = (
     "https://raw.githubusercontent.com/Ariane-Prado/conversorplanodecorte"
     "/main/versao.json"
@@ -529,6 +529,12 @@ def aplicar_atualizacao_e_reiniciar(caminho_novo_exe: str):
   baixado) pode segurar o arquivo travado por mais um instante — sem
   retry isso falhava com "Acesso negado" e reabria o app antigo sem
   trocar nada.
+
+  O limite de tentativas é de 5 minutos: em máquinas mais lentas o
+  antivírus pode demorar bem mais que alguns segundos pra liberar um
+  .exe desconhecido recém-baixado (visto na prática — 60 tentativas de
+  1s, ou seja 1 minuto, não foi suficiente e a troca falhava mesmo com
+  o arquivo íntegro).
   """
   exe_atual = sys.executable
   pasta = os.path.dirname(exe_atual)
@@ -550,9 +556,12 @@ def aplicar_atualizacao_e_reiniciar(caminho_novo_exe: str):
       f'move /Y "{caminho_novo_exe}" "{exe_atual}" >NUL 2>&1\n'
       "if errorlevel 1 (\n"
       "    set /a tentativas+=1\n"
-      "    if %tentativas% GEQ 60 (\n"
-      "        echo Nao foi possivel substituir o executavel (arquivo"
-      " ainda em uso ou bloqueado pelo antivirus).\n"
+      "    if %tentativas% GEQ 300 (\n"
+      "        echo Nao foi possivel substituir o executavel apos 5 minutos"
+      " (arquivo ainda em uso ou bloqueado pelo antivirus).\n"
+      "        echo Tente novamente ou substitua manualmente pelo arquivo"
+      " baixado em:\n"
+      f"        echo {caminho_novo_exe}\n"
       "        pause\n"
       "        exit /b 1\n"
       "    )\n"
