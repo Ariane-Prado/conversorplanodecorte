@@ -6,6 +6,10 @@ on:
       - "v*"
       - "V*"
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Tag da release a publicar (ex: V1.2.1). Deixe em branco para usar a tag do push."
+        required: false
 
 permissions:
   contents: write
@@ -34,5 +38,6 @@ jobs:
       - name: Publicar Release no GitHub
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
           files: dist/app.exe
           generate_release_notes: true
