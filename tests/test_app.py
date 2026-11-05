@@ -482,5 +482,57 @@ class TestAjustesConferenciaFundoEContraFrente(unittest.TestCase):
     self.assertEqual(df_ajustado.loc[7, "Largura"], 600.0)
 
 
+class TestPersistenciaHistorico(unittest.TestCase):
+  """Garante que o histórico é mesclado entre pastas e nunca sobrescrito por outra janela."""
+
+  def _criar_instancia_fake(self, arq_local, arq_usuario, cliente="Vitor", ambiente="Suite 1"):
+    inst = object.__new__(app.ConversorXmlExcelApp)
+    inst.arquivo_historico = arq_local
+    inst.arquivo_historico_usuario = arq_usuario
+    inst.cliente_nome = cliente
+    inst.ambiente_nome = ambiente
+    inst.frames = {}
+    inst.historico = inst.carregar_historico()
+    return inst
+
+  def test_duas_instancias_nao_sobrescrevem_historico_uma_da_outra(self):
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      arq_local_1 = os.path.join(tmpdir, "pasta1", "historico_recentes.json")
+      arq_local_2 = os.path.join(tmpdir, "pasta2", "historico_recentes.json")
+      os.makedirs(os.path.dirname(arq_local_1), exist_ok=True)
+      os.makedirs(os.path.dirname(arq_local_2), exist_ok=True)
+      arq_usr = os.path.join(tmpdir, ".conversor_promob_historico.json")
+
+      # Instância 1 e Instância 2 abertas ao mesmo tempo em pastas diferentes
+      inst1 = self._criar_instancia_fake(arq_local_1, arq_usr, "Vitor", "Suite 1")
+      inst2 = self._criar_instancia_fake(arq_local_2, arq_usr, "Vitor", "Suite Casal")
+
+      inst1.adicionar_ao_historico(
+          "C:/vitor/Conf - Suite 1.xml",
+          "C:/vitor/Vitor_Suite_1_Tobias.xlsx",
+          "Tobias",
+      )
+      inst2.adicionar_ao_historico(
+          "C:/vitor/Conf - Suite Casal.xml",
+          "C:/vitor/Vitor_Suite_Casal_Tobias.xlsx",
+          "Tobias",
+      )
+
+      inst2.ambiente_nome = "Escritorio"
+      inst2.adicionar_ao_historico(
+          "C:/vitor/Conf - Escritorio.xml",
+          "C:/vitor/Vitor_Escritorio_Tobias.xlsx",
+          "Tobias",
+      )
+
+      ambientes_salvos = [item["ambiente"] for item in inst2.carregar_historico()]
+      self.assertEqual(
+          ambientes_salvos,
+          ["Escritorio", "Suite Casal", "Suite 1"],
+      )
+
+
 if __name__ == "__main__":
   unittest.main()

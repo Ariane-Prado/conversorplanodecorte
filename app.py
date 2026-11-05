@@ -123,6 +123,9 @@ class ConversorXmlExcelApp(ctk.CTk):
     self.arquivo_historico = os.path.join(
         obter_caminho_base(), "historico_recentes.json"
     )
+    self.arquivo_historico_usuario = os.path.join(
+        os.path.expanduser("~"), ".conversor_promob_historico.json"
+    )
     self.historico = self.carregar_historico()
 
     self.frame_topo = ctk.CTkFrame(self, fg_color="transparent")
@@ -312,23 +315,93 @@ class ConversorXmlExcelApp(ctk.CTk):
           "\n\nFeche o programa e substitua manualmente se quiser.",
       )
 
-  def carregar_historico(self):
-    if os.path.exists(self.arquivo_historico):
+  @staticmethod
+  def _normalizar_caminho_historico(caminho: str) -> str:
+    if not caminho:
+      return ""
+    return os.path.normcase(os.path.normpath(str(caminho)))
+
+  @classmethod
+  def _chave_item_historico(cls, item: dict) -> tuple[str, str]:
+    return (
+        cls._normalizar_caminho_historico(item.get("caminho_xml", "")),
+        cls._normalizar_caminho_historico(item.get("caminho_excel", "")),
+    )
+
+  @staticmethod
+  def _timestamp_item_historico(item: dict) -> float:
+    data_str = item.get("data_hora", "")
+    if data_str:
       try:
-        with open(self.arquivo_historico, "r", encoding="utf-8") as f:
-          return json.load(f)
+        dt = datetime.datetime.strptime(data_str, "%d/%m/%Y %H:%M")
+        return dt.timestamp()
+      except ValueError:
+        pass
+    return 0.0
+
+  def _caminhos_arquivos_historico(self) -> list[str]:
+    caminhos = []
+    for attr in ("arquivo_historico", "arquivo_historico_usuario"):
+      caminho = getattr(self, attr, None)
+      if caminho:
+        norm = self._normalizar_caminho_historico(os.path.abspath(caminho))
+        if all(
+            self._normalizar_caminho_historico(os.path.abspath(c)) != norm
+            for c in caminhos
+        ):
+          caminhos.append(caminho)
+    return caminhos
+
+  def carregar_historico(self):
+    itens_por_chave = {}
+    ordem_insercao = []
+    for caminho in self._caminhos_arquivos_historico():
+      if not os.path.exists(caminho):
+        continue
+      try:
+        with open(caminho, "r", encoding="utf-8") as f:
+          dados = json.load(f)
+        if not isinstance(dados, list):
+          continue
       except Exception:
-        return []
-    return []
+        continue
+
+      for item in dados:
+        if not isinstance(item, dict):
+          continue
+        chave = self._chave_item_historico(item)
+        if chave not in itens_por_chave:
+          itens_por_chave[chave] = item
+          ordem_insercao.append(chave)
+        else:
+          if self._timestamp_item_historico(item) > self._timestamp_item_historico(
+              itens_por_chave[chave]
+          ):
+            itens_por_chave[chave] = item
+
+    # Ordena do mais recente para o mais antigo mantendo a ordem relativa em caso de empate
+    chaves_ordenadas = sorted(
+         range(len(ordem_insercao)),
+        key=lambda i: (
+            -self._timestamp_item_historico(itens_por_chave[ordem_insercao[i]]),
+            i,
+        ),
+    )
+    return [itens_por_chave[ordem_insercao[i]] for i in chaves_ordenadas][:50]
 
   def salvar_historico(self):
-    try:
-      with open(self.arquivo_historico, "w", encoding="utf-8") as f:
-        json.dump(self.historico[:15], f, ensure_ascii=False, indent=2)
-    except Exception as e:
-      print(f"Erro ao salvar histórico: {e}")
+    dados = self.historico[:50]
+    for caminho in self._caminhos_arquivos_historico():
+      try:
+        with open(caminho, "w", encoding="utf-8") as f:
+          json.dump(dados, f, ensure_ascii=False, indent=2)
+      except Exception as e:
+        print(f"Erro ao salvar histórico em {caminho}: {e}")
 
   def adicionar_ao_historico(self, caminho_xml, caminho_excel, fornecedor):
+    # Recarrega antes de inserir para nunca sobrescrever projetos salvos por outra
+    # janela aberta ou outra instância do aplicativo.
+    self.historico = self.carregar_historico()
     novo_registro = {
         "nome_xml": os.path.basename(caminho_xml),
         "caminho_xml": caminho_xml,
@@ -338,14 +411,14 @@ class ConversorXmlExcelApp(ctk.CTk):
         "fornecedor": fornecedor,
         "data_hora": datetime.datetime.now().strftime("%d/%m/%Y %H:%M"),
     }
+    chave_nova = self._chave_item_historico(novo_registro)
     self.historico = [
         item
         for item in self.historico
-        if item["caminho_xml"] != caminho_xml
-        or item["caminho_excel"] != caminho_excel
+        if self._chave_item_historico(item) != chave_nova
     ]
     self.historico.insert(0, novo_registro)
-    self.historico = self.historico[:15]
+    self.historico = self.historico[:50]
     self.salvar_historico()
 
     if "TelaInicio" in self.frames:

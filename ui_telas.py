@@ -173,8 +173,11 @@ class TelaInicio(ctk.CTkFrame):
 
   def fazer_backup(self):
     try:
+      if hasattr(self.controller, "carregar_historico"):
+        self.controller.historico = self.controller.carregar_historico()
+        self.controller.salvar_historico()
       historico_path = self.controller.arquivo_historico
-      if not os.path.exists(historico_path):
+      if not os.path.exists(historico_path) or not self.controller.historico:
         messagebox.showwarning(
             "Aviso", "Não há dados salvos para fazer backup ainda."
         )
@@ -211,6 +214,8 @@ class TelaInicio(ctk.CTkFrame):
           zf.extract("historico_recentes.json", path=pasta_temp)
 
         self.controller.historico = self.controller.carregar_historico()
+        if hasattr(self.controller, "salvar_historico"):
+          self.controller.salvar_historico()
         self.atualizar_interface_historico()
         messagebox.showinfo(
             "Sucesso", "Backup restaurado com sucesso! Seus projetos foram"
@@ -228,6 +233,9 @@ class TelaInicio(ctk.CTkFrame):
   def atualizar_interface_historico(self):
     for widget in self.scroll_recentes.winfo_children():
       widget.destroy()
+
+    if hasattr(self.controller, "carregar_historico"):
+      self.controller.historico = self.controller.carregar_historico()
 
     # Um projeto só entra na lista se o XML original e a pasta do Excel
     # exportado ainda existirem — caso contrário "Abrir" e "Editar" não
