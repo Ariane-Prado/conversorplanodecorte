@@ -33,7 +33,7 @@ COR_FUNDO_INPUT = "#2B2B2B"
 COR_BORDA_INPUT = "#444444"
 COR_FOCO_INPUT = "#2980b9"
 
-VERSAO_ATUAL = "1.2.2"
+VERSAO_ATUAL = "1.3.0"
 URL_VERSAO_REMOTA = (
     "https://raw.githubusercontent.com/Ariane-Prado/conversorplanodecorte"
     "/main/versao.json"
@@ -116,6 +116,34 @@ FUNCOES_AFETADAS_TERCEIRIZACAO = {"Base", "Tampo", "Prateleira"}
 # "L" como palavra isolada (não início de "Lavatório" etc.) logo após
 # "canto", com qualquer quantidade de espaço entre os dois.
 _PADRAO_MODULO_CANTO_L = re.compile(r"\bcanto\s*l\b")
+
+# Ajustes opcionais de conferência:
+# 1) Fundo 6mm: passar o avanço lateral de 5mm para 8mm de cada lado (+3mm de
+#    cada lado = +6mm no total). Em armários com base e chapéu (roupeiros e
+#    armários aéreos) soma +6mm nas duas medidas (Comprimento e Largura); em
+#    balcões inferiores e gavetas soma +6mm apenas na medida da largura (em
+#    relação à Base ou à Contra Frente).
+# 2) Contra Frente / Contra Fundo de Gaveta: reduzir 3mm na altura (a menor
+#    medida da tira).
+AVANCO_PADRAO_TOTAL_MM = 10.0  # 5mm de cada lado no XML original
+AJUSTE_FUNDO_8MM_DELTA = 6.0   # +3mm de cada lado (passando de 5mm para 8mm)
+AJUSTE_CONTRA_FRENTE_ALTURA_DELTA = -3.0
+FUNCAO_CONTRA_FRENTE_FUNDO = "Contra Frente / Contra Fundo de Gaveta"
+FUNCAO_FUNDO = "Fundo"
+
+_TOKENS_BALCAO_INFERIOR = {"inf", "inferior", "balcao", "gaveteiro"}
+_TOKENS_ARMARIO_BASE_CHAPEU = {
+    "sup",
+    "superior",
+    "aereo",
+    "roup",
+    "roupeiro",
+    "dor",
+    "dorm",
+    "dormitorio",
+    "armario",
+}
+_PADRAO_ESPESSURA_MM = re.compile(r"(\d+(?:[.,]\d+)?)\s*mm\b", re.IGNORECASE)
 
 
 def _normalizar_texto(texto: str) -> str:
@@ -386,6 +414,381 @@ def extrair_modulo_pai(item, parent_map: dict) -> str:
       return desc
     curr = parent_map.get(curr)
   return ""
+
+
+def _eh_espessura_6mm_texto(texto: str) -> bool:
+  """Retorna True se `texto` indica 6mm (ou não especifica espessura)."""
+  matches = _PADRAO_ESPESSURA_MM.findall(texto or "")
+  if not matches:
+    return True
+  for m in matches:
+    try:
+      if abs(float(m.replace(",", ".")) - 6.0) < 1.0:
+        return True
+    except ValueError:
+      pass
+  return False
+
+
+def eh_fundo_6mm(item, refs: dict, funcao_formatada: str = None) -> bool:
+  """Verifica se um <ITEM> do XML representa uma peça de Fundo de 6mm."""
+  desc = item.attrib.get("DESCRIPTION", "").strip()
+  func = funcao_formatada if funcao_formatada is not None else renomear_funcao(desc)
+  if func != FUNCAO_FUNDO:
+    return False
+
+  height_str = item.attrib.get("HEIGHT", "").strip()
+  if height_str:
+    try:
+      return abs(float(height_str.replace(",", ".")) - 6.0) < 1.0
+    except ValueError:
+      pass
+
+  material_txt = f"{refs.get('MATERIAL', '')} {desc}"
+  return _eh_espessura_6mm_texto(material_txt)
+
+
+def escolher_eixo_largura_fundo(
+    comp_fundo: float,
+    larg_fundo: float,
+    medidas_referencia: list = None,
+    delta: float = AJUSTE_FUNDO_8MM_DELTA,
+) -> tuple:
+  """Escolhe qual medida do Fundo (Comprimento ou Largura) corresponde à
+  largura do módulo/gaveta (que já tem avanço de 5mm de cada lado = +10mm em
+  relação à largura da Base ou da Contra Frente).
+
+  Se `larg_fundo` bate com `medida_ref + 10mm` (±1.5mm) e `comp_fundo` não,
+  aplica `delta` na Largura; caso contrário aplica no Comprimento (padrão
+  WIDTH do XML no Promob).
+  """
+  refs = [float(r) for r in (medidas_referencia or []) if r]
+  if refs:
+    comp_bate = any(
+        abs(comp_fundo - (r + AVANCO_PADRAO_TOTAL_MM)) <= 1.5 for r in refs
+    )
+    larg_bate = any(
+        abs(larg_fundo - (r + AVANCO_PADRAO_TOTAL_MM)) <= 1.5 for r in refs
+    )
+    if larg_bate and not comp_bate:
+      return (0.0, float(delta))
+  return (float(delta), 0.0)
+
+
+def calcular_delta_contra_frente(
+    comp: float,
+    larg: float,
+    delta: float = AJUSTE_CONTRA_FRENTE_ALTURA_DELTA,
+) -> tuple:
+  """Retorna (delta_comp, delta_larg) para reduzir a altura (menor medida)
+  da Contra Frente / Contra Fundo de Gaveta."""
+  if larg <= comp:
+    return (0.0, float(delta))
+  return (float(delta), 0.0)
+
+
+def _tokens_normalizados(texto: str) -> set:
+  return set(re.findall(r"\w+", _normalizar_texto(texto)))
+
+
+def mapear_contexto_modulos_xml(items_source: list, parent_map: dict) -> dict:
+  """Agrupa, por módulo ancestral, as funções e medidas de Base e Contra Frente
+  para apoiar a classificação dos Fundos de 6mm do projeto."""
+  contexto = {}
+  for item in items_source:
+    refs = extrair_referencias(item)
+    if deve_ignorar_item(item, refs):
+      continue
+    anc = _encontrar_item_ancestral(item, parent_map)
+    chave_mod = (
+        anc if anc is not None else extrair_modulo_pai(item, parent_map)
+    )
+    info = contexto.setdefault(
+        chave_mod,
+        {
+            "funcoes_caixa": set(),
+            "medidas_base": [],
+            "larguras_cf": [],
+        },
+    )
+    desc = item.attrib.get("DESCRIPTION", "").strip()
+    func = renomear_funcao(desc)
+    try:
+      comp = float(item.attrib.get("WIDTH", "0"))
+    except ValueError:
+      comp = 0.0
+    try:
+      larg = float(item.attrib.get("DEPTH", "0"))
+    except ValueError:
+      larg = 0.0
+
+    if "gav" not in _normalizar_texto(desc):
+      info["funcoes_caixa"].add(func)
+    if func == "Base" and (comp or larg):
+      info["medidas_base"].extend([m for m in (comp, larg) if m > 0])
+    elif func == FUNCAO_CONTRA_FRENTE_FUNDO and (comp or larg):
+      info["larguras_cf"].append(max(comp, larg))
+  return contexto
+
+
+def _eh_item_gaveta_xml(
+    item, parent_map: dict, info_mod: dict, comp: float, larg: float
+) -> bool:
+  desc_norm = _normalizar_texto(item.attrib.get("DESCRIPTION", ""))
+  if "gav" in desc_norm:
+    return True
+
+  # Verifica ancestrais intermediários (ex: sub-item "Gaveta" ou CGAV)
+  curr = parent_map.get(item)
+  while curr is not None:
+    if curr.tag == "ITEM":
+      refs_anc = extrair_referencias(curr)
+      desc_anc = _normalizar_texto(curr.attrib.get("DESCRIPTION", ""))
+      if (
+          refs_anc.get("ITEM_BASE") == "CGAV"
+          or "gaveta" in _tokens_normalizados(desc_anc)
+      ):
+        return True
+    curr = parent_map.get(curr)
+
+  larguras_cf = info_mod.get("larguras_cf", [])
+  medidas_base = info_mod.get("medidas_base", [])
+  funcoes_caixa = info_mod.get("funcoes_caixa", set())
+
+  if larguras_cf and "Base" not in funcoes_caixa:
+    return True
+
+  if larguras_cf:
+    bate_cf = any(
+        abs(comp - (r + AVANCO_PADRAO_TOTAL_MM)) <= 1.5
+        or abs(larg - (r + AVANCO_PADRAO_TOTAL_MM)) <= 1.5
+        for r in larguras_cf
+    )
+    bate_base = any(
+        abs(comp - (r + AVANCO_PADRAO_TOTAL_MM)) <= 1.5
+        or abs(larg - (r + AVANCO_PADRAO_TOTAL_MM)) <= 1.5
+        for r in medidas_base
+    )
+    if bate_cf and not bate_base:
+      return True
+
+  return False
+
+
+def calcular_delta_fundo_xml(
+    item,
+    refs: dict,
+    parent_map: dict,
+    contexto_modulos: dict,
+    delta: float = AJUSTE_FUNDO_8MM_DELTA,
+) -> tuple:
+  """Retorna (delta_comp, delta_larg) para um <ITEM> de Fundo 6mm:
+  - Roupeiro / Armário Aéreo (armário com Base e Chapéu): (+6, +6)
+  - Balcão Inferior ou Gaveta: (+6, 0) ou (0, +6) apenas na medida da largura
+  - Demais peças (ou Fundo que não seja 6mm): (0, 0)
+  """
+  if not eh_fundo_6mm(item, refs):
+    return (0.0, 0.0)
+
+  try:
+    comp = float(item.attrib.get("WIDTH", "0"))
+  except ValueError:
+    comp = 0.0
+  try:
+    larg = float(item.attrib.get("DEPTH", "0"))
+  except ValueError:
+    larg = 0.0
+
+  anc = _encontrar_item_ancestral(item, parent_map)
+  chave_mod = (
+      anc if anc is not None else extrair_modulo_pai(item, parent_map)
+  )
+  info_mod = contexto_modulos.get(chave_mod, {})
+
+  if _eh_item_gaveta_xml(item, parent_map, info_mod, comp, larg):
+    return escolher_eixo_largura_fundo(
+        comp, larg, info_mod.get("larguras_cf", []), delta=delta
+    )
+
+  tokens_peca = _tokens_normalizados(item.attrib.get("DESCRIPTION", ""))
+  modulo_nome = extrair_modulo_pai(item, parent_map)
+  tokens_mod = _tokens_normalizados(modulo_nome)
+  funcoes_caixa = info_mod.get("funcoes_caixa", set())
+  medidas_base = info_mod.get("medidas_base", [])
+
+  if tokens_peca & _TOKENS_BALCAO_INFERIOR:
+    return escolher_eixo_largura_fundo(comp, larg, medidas_base, delta=delta)
+  if tokens_peca & _TOKENS_ARMARIO_BASE_CHAPEU:
+    return (float(delta), float(delta))
+
+  if "Base" in funcoes_caixa and "Tampo" in funcoes_caixa:
+    return (float(delta), float(delta))
+
+  if "Base" in funcoes_caixa and "Tampo" not in funcoes_caixa:
+    if (tokens_mod & _TOKENS_ARMARIO_BASE_CHAPEU) and not (
+        tokens_mod & _TOKENS_BALCAO_INFERIOR
+    ):
+      return (float(delta), float(delta))
+    return escolher_eixo_largura_fundo(comp, larg, medidas_base, delta=delta)
+
+  if tokens_mod & _TOKENS_BALCAO_INFERIOR:
+    return escolher_eixo_largura_fundo(comp, larg, medidas_base, delta=delta)
+  if tokens_mod & _TOKENS_ARMARIO_BASE_CHAPEU:
+    return (float(delta), float(delta))
+
+  return escolher_eixo_largura_fundo(comp, larg, medidas_base, delta=delta)
+
+
+def calcular_deltas_ajuste_df(df: pd.DataFrame) -> tuple:
+  """Retorna (deltas_fundo, deltas_cf) mapeados pelo índice do DataFrame.
+
+  Se `df.attrs["deltas_fundo"]` já tiver sido calculado na leitura do XML,
+  reaproveita esses valores; caso contrário, infere diretamente das linhas do
+  DataFrame usando as mesmas regras de módulo (Base + Tampo vs Balcão/Gaveta).
+  """
+  col_comp = "COMP\n2750" if "COMP\n2750" in df.columns else "Comprimento"
+  col_larg = "LARG\n1840" if "LARG\n1840" in df.columns else "Largura"
+  col_func = "NOME DA PEÇA" if "NOME DA PEÇA" in df.columns else "Função"
+  col_mod = "OBS 1" if "OBS 1" in df.columns else "Complemento"
+  col_mat = "ESP MDF" if "ESP MDF" in df.columns else "Material"
+
+  deltas_cf = {}
+  for idx, row in df.iterrows():
+    func = str(row.get(col_func, "")).strip()
+    if func == FUNCAO_CONTRA_FRENTE_FUNDO:
+      try:
+        comp = float(row.get(col_comp, 0) or 0)
+      except (TypeError, ValueError):
+        comp = 0.0
+      try:
+        larg = float(row.get(col_larg, 0) or 0)
+      except (TypeError, ValueError):
+        larg = 0.0
+      deltas_cf[idx] = calcular_delta_contra_frente(comp, larg)
+
+  deltas_xml = df.attrs.get("deltas_fundo") if hasattr(df, "attrs") else None
+  if isinstance(deltas_xml, dict) and deltas_xml:
+    deltas_fundo = {
+        idx: tuple(deltas_xml.get(idx, (0.0, 0.0))) for idx in df.index
+    }
+    return deltas_fundo, deltas_cf
+
+  # Inferência direta a partir do DataFrame quando não há metadados do XML
+  info_por_mod = {}
+  for idx, row in df.iterrows():
+    mod = str(row.get(col_mod, "")).strip()
+    func = str(row.get(col_func, "")).strip()
+    try:
+      comp = float(row.get(col_comp, 0) or 0)
+    except (TypeError, ValueError):
+      comp = 0.0
+    try:
+      larg = float(row.get(col_larg, 0) or 0)
+    except (TypeError, ValueError):
+      larg = 0.0
+    info = info_por_mod.setdefault(
+        mod, {"funcoes": set(), "medidas_base": [], "larguras_cf": []}
+    )
+    info["funcoes"].add(func)
+    if func == "Base" and (comp or larg):
+      info["medidas_base"].extend([m for m in (comp, larg) if m > 0])
+    elif func == FUNCAO_CONTRA_FRENTE_FUNDO and (comp or larg):
+      info["larguras_cf"].append(max(comp, larg))
+
+  deltas_fundo = {}
+  for idx, row in df.iterrows():
+    func = str(row.get(col_func, "")).strip()
+    if func != FUNCAO_FUNDO:
+      continue
+    mat_txt = str(row.get(col_mat, "") or "")
+    if not _eh_espessura_6mm_texto(mat_txt):
+      continue
+    try:
+      comp = float(row.get(col_comp, 0) or 0)
+    except (TypeError, ValueError):
+      comp = 0.0
+    try:
+      larg = float(row.get(col_larg, 0) or 0)
+    except (TypeError, ValueError):
+      larg = 0.0
+    mod = str(row.get(col_mod, "")).strip()
+    info = info_por_mod.get(mod, {})
+    funcoes = info.get("funcoes", set())
+    medidas_base = info.get("medidas_base", [])
+    larguras_cf = info.get("larguras_cf", [])
+    tokens_mod = _tokens_normalizados(mod)
+
+    eh_gav = "gaveta" in tokens_mod or (
+        bool(larguras_cf) and "Base" not in funcoes
+    )
+    if not eh_gav and larguras_cf:
+      bate_cf = any(
+          abs(comp - (r + AVANCO_PADRAO_TOTAL_MM)) <= 1.5
+          or abs(larg - (r + AVANCO_PADRAO_TOTAL_MM)) <= 1.5
+          for r in larguras_cf
+      )
+      bate_base = any(
+          abs(comp - (r + AVANCO_PADRAO_TOTAL_MM)) <= 1.5
+          or abs(larg - (r + AVANCO_PADRAO_TOTAL_MM)) <= 1.5
+          for r in medidas_base
+      )
+      if bate_cf and not bate_base:
+        eh_gav = True
+
+    if eh_gav:
+      deltas_fundo[idx] = escolher_eixo_largura_fundo(comp, larg, larguras_cf)
+    elif "Base" in funcoes and "Tampo" in funcoes:
+      deltas_fundo[idx] = (AJUSTE_FUNDO_8MM_DELTA, AJUSTE_FUNDO_8MM_DELTA)
+    elif "Base" in funcoes and "Tampo" not in funcoes:
+      if (tokens_mod & _TOKENS_ARMARIO_BASE_CHAPEU) and not (
+          tokens_mod & _TOKENS_BALCAO_INFERIOR
+      ):
+        deltas_fundo[idx] = (AJUSTE_FUNDO_8MM_DELTA, AJUSTE_FUNDO_8MM_DELTA)
+      else:
+        deltas_fundo[idx] = escolher_eixo_largura_fundo(comp, larg, medidas_base)
+    elif tokens_mod & _TOKENS_BALCAO_INFERIOR:
+      deltas_fundo[idx] = escolher_eixo_largura_fundo(comp, larg, medidas_base)
+    elif tokens_mod & _TOKENS_ARMARIO_BASE_CHAPEU:
+      deltas_fundo[idx] = (AJUSTE_FUNDO_8MM_DELTA, AJUSTE_FUNDO_8MM_DELTA)
+    else:
+      deltas_fundo[idx] = escolher_eixo_largura_fundo(comp, larg, medidas_base)
+
+  return deltas_fundo, deltas_cf
+
+
+def aplicar_ajustes_medidas_df(
+    df: pd.DataFrame,
+    avanco_fundo_8mm: bool = False,
+    reduzir_contra_frente_3mm: bool = False,
+) -> pd.DataFrame:
+  """Retorna uma cópia de `df` aplicando os ajustes solicitados nas medidas."""
+  resultado = df.copy()
+  deltas_fundo, deltas_cf = calcular_deltas_ajuste_df(df)
+  col_comp = "COMP\n2750" if "COMP\n2750" in resultado.columns else "Comprimento"
+  col_larg = "LARG\n1840" if "LARG\n1840" in resultado.columns else "Largura"
+
+  def _somar(idx, col, delta):
+    if not delta or col not in resultado.columns:
+      return
+    novo = round(float(resultado.at[idx, col]) + delta, 4)
+    if pd.api.types.is_integer_dtype(resultado[col].dtype) and novo.is_integer():
+      resultado.at[idx, col] = int(novo)
+    else:
+      resultado.at[idx, col] = novo
+
+  if avanco_fundo_8mm:
+    for idx, (dc, dl) in deltas_fundo.items():
+      if idx in resultado.index:
+        _somar(idx, col_comp, dc)
+        _somar(idx, col_larg, dl)
+
+  if reduzir_contra_frente_3mm:
+    for idx, (dc, dl) in deltas_cf.items():
+      if idx in resultado.index:
+        _somar(idx, col_comp, dc)
+        _somar(idx, col_larg, dl)
+
+  return resultado
 
 
 def extrair_cliente_ambiente_xml(xml_path: str):
@@ -1318,7 +1721,12 @@ class JanelaRevisao(ctk.CTkToplevel):
 
     self.parent = parent
     self.df = df.copy()
+    if hasattr(df, "attrs") and df.attrs:
+      self.df.attrs = dict(df.attrs)
     self.callback_salvar = callback_salvar
+    self._deltas_fundo, self._deltas_cf = calcular_deltas_ajuste_df(self.df)
+    self._fundo_aplicado = {idx: False for idx in self.df.index}
+    self._cf_aplicado = {idx: False for idx in self.df.index}
 
     # Sem transient(): no Windows, uma janela "transient" (presa à janela
     # dona) perde os botões de minimizar/maximizar — é comportamento nativo
@@ -1433,6 +1841,54 @@ class JanelaRevisao(ctk.CTkToplevel):
         font=ctk.CTkFont(size=12),
     )
     self.lbl_dica_selecao.pack(side="right")
+
+    # Barra de ajustes rápidos de conferência (Fundo 6mm para avanço de 8mm
+    # de cada lado = +6mm, e Contra Frente / Contra Fundo de Gaveta -3mm na
+    # altura). Marcar ou desmarcar atualiza a tabela imediatamente.
+    self.frame_ajustes = ctk.CTkFrame(self, fg_color="#2c3e50", corner_radius=8)
+    self.frame_ajustes.pack(pady=(0, 6), padx=20, fill="x")
+
+    self.lbl_ajustes_titulo = ctk.CTkLabel(
+        self.frame_ajustes,
+        text="🔧 Ajustes de Conferência:",
+        font=ctk.CTkFont(size=12, weight="bold"),
+        text_color=COR_TITULO,
+    )
+    self.lbl_ajustes_titulo.pack(side="left", padx=(12, 10), pady=8)
+
+    self.var_fundo_8mm = ctk.BooleanVar(value=False)
+    self.chk_fundo_8mm = ctk.CTkCheckBox(
+        self.frame_ajustes,
+        text="Avanço Fundo 6mm p/ 8mm de cada lado (+6mm)",
+        variable=self.var_fundo_8mm,
+        font=ctk.CTkFont(size=12, weight="bold"),
+        text_color=COR_TITULO,
+        command=self._ao_alternar_ajustes,
+    )
+    self.chk_fundo_8mm.pack(side="left", padx=(4, 16), pady=8)
+    criar_tooltip(
+        self.chk_fundo_8mm,
+        "Passa o avanço do Fundo 6mm de 5mm para 8mm de cada lado (+6mm no"
+        " total): soma +6mm nas duas medidas em armários com base e chapéu"
+        " (roupeiros e armários aéreos) e +6mm na largura em balcões"
+        " inferiores e gavetas.",
+    )
+
+    self.var_cf_menos_3mm = ctk.BooleanVar(value=False)
+    self.chk_cf_menos_3mm = ctk.CTkCheckBox(
+        self.frame_ajustes,
+        text="Reduzir Contra Frente / Contra Fundo 3mm na altura (-3mm)",
+        variable=self.var_cf_menos_3mm,
+        font=ctk.CTkFont(size=12, weight="bold"),
+        text_color=COR_TITULO,
+        command=self._ao_alternar_ajustes,
+    )
+    self.chk_cf_menos_3mm.pack(side="left", padx=4, pady=8)
+    criar_tooltip(
+        self.chk_cf_menos_3mm,
+        "Reduz 3mm na altura (menor medida) de todas as peças de Contra"
+        " Frente / Contra Fundo de Gaveta.",
+    )
 
     self.frame_tabla = ctk.CTkFrame(self)
     self.frame_tabla.pack(padx=15, pady=5, fill="both", expand=True)
@@ -1930,12 +2386,59 @@ class JanelaRevisao(ctk.CTkToplevel):
       if not self.tree.get_children():
         self.lbl_alerta_dim.configure(text="Nenhuma peça será exportada.")
 
+  def _colunas_dimensoes(self):
+    col_comp = "COMP\n2750" if "COMP\n2750" in self.df.columns else "Comprimento"
+    col_larg = "LARG\n1840" if "LARG\n1840" in self.df.columns else "Largura"
+    return col_comp, col_larg
+
+  def _somar_nas_dimensoes(self, idx, d_comp: float, d_larg: float):
+    col_comp, col_larg = self._colunas_dimensoes()
+    for col, delta in ((col_comp, d_comp), (col_larg, d_larg)):
+      if not delta or col not in self.df.columns:
+        continue
+      val_atual = float(self.df.at[idx, col])
+      novo_val = round(val_atual + delta, 4)
+      if pd.api.types.is_integer_dtype(self.df[col].dtype) and novo_val.is_integer():
+        self.df.at[idx, col] = int(novo_val)
+      else:
+        self.df.at[idx, col] = novo_val
+
+  def _sincronizar_ajustes_no_df(self):
+    fundo_ativo = bool(self.var_fundo_8mm.get())
+    cf_ativo = bool(self.var_cf_menos_3mm.get())
+
+    for idx in self.df.index:
+      d_comp_f, d_larg_f = self._deltas_fundo.get(idx, (0.0, 0.0))
+      if d_comp_f or d_larg_f:
+        aplicado_f = self._fundo_aplicado.get(idx, False)
+        if fundo_ativo and not aplicado_f:
+          self._somar_nas_dimensoes(idx, d_comp_f, d_larg_f)
+          self._fundo_aplicado[idx] = True
+        elif not fundo_ativo and aplicado_f:
+          self._somar_nas_dimensoes(idx, -d_comp_f, -d_larg_f)
+          self._fundo_aplicado[idx] = False
+
+      d_comp_cf, d_larg_cf = self._deltas_cf.get(idx, (0.0, 0.0))
+      if d_comp_cf or d_larg_cf:
+        aplicado_cf = self._cf_aplicado.get(idx, False)
+        if cf_ativo and not aplicado_cf:
+          self._somar_nas_dimensoes(idx, d_comp_cf, d_larg_cf)
+          self._cf_aplicado[idx] = True
+        elif not cf_ativo and aplicado_cf:
+          self._somar_nas_dimensoes(idx, -d_comp_cf, -d_larg_cf)
+          self._cf_aplicado[idx] = False
+
+  def _ao_alternar_ajustes(self):
+    self._sincronizar_ajustes_no_df()
+    self.carregar_dados_tree()
+
   def desfazer_exclusao(self):
     if self._ultima_exclusao is None or self._ultima_exclusao.empty:
       return
     self.df = pd.concat([self.df, self._ultima_exclusao]).sort_index()
     self._ultima_exclusao = None
     self.btn_desfazer.configure(state="disabled")
+    self._sincronizar_ajustes_no_df()
     self.carregar_dados_tree()
 
   def confirmar_e_salvar(self):
@@ -2908,6 +3411,7 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
 
     parent_map = {c: p for p in root.iter() for c in p}
     fab_map = extrair_fabricantes_do_xml(root)
+    contexto_modulos = mapear_contexto_modulos_xml(items_source, parent_map)
 
     cli_xml, amb_xml = extrair_cliente_ambiente_xml(xml_path)
     nome_cliente = self.controller.cliente_nome or cli_xml or "Cliente"
@@ -2915,6 +3419,7 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
 
     rows_padrao = []
     rows_tmk = []
+    lista_deltas_fundo = []
     item_num_tmk = 1
 
     for item in items_source:
@@ -2941,6 +3446,11 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
       if margem_terceirizacao and funcao_formatada in FUNCOES_AFETADAS_TERCEIRIZACAO:
         comprimento += margem_terceirizacao
         largura += margem_terceirizacao
+
+      delta_fundo = calcular_delta_fundo_xml(
+          item, refs, parent_map, contexto_modulos
+      )
+      lista_deltas_fundo.append(delta_fundo)
 
       row_p = {
           "Quantidade": int(float(item.attrib.get("QUANTITY", "1"))),
@@ -3033,6 +3543,12 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
       ]
       df = pd.DataFrame(rows_padrao, columns=colunas_p)
 
+    deltas_por_idx = {
+        idx: delta
+        for idx, delta in enumerate(lista_deltas_fundo)
+        if delta != (0.0, 0.0)
+    }
+
     if self.chk_agrupar_var.get() and not df.empty:
       resposta = messagebox.askyesno(
           "Confirmar Agrupamento",
@@ -3040,6 +3556,8 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
           " agrupar as peças idênticas e somar suas quantidades?",
       )
       if resposta:
+        df["_delta_comp_f"] = [d[0] for d in lista_deltas_fundo]
+        df["_delta_larg_f"] = [d[1] for d in lista_deltas_fundo]
         if fornecedor_alvo == "TMKPlanilha":
           cols_agrupar = [
               "COMP\n2750",
@@ -3057,12 +3575,19 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
               "COR MDF",
               "ESP MDF",
               "ESP FITA",
+              "_delta_comp_f",
+              "_delta_larg_f",
           ]
           df = (
               df.groupby(cols_agrupar, as_index=False, dropna=False)[
                   "QUANT"
               ].sum()
           )
+          deltas_por_idx = {
+              idx: (float(row["_delta_comp_f"]), float(row["_delta_larg_f"]))
+              for idx, row in df.iterrows()
+              if (row["_delta_comp_f"] or row["_delta_larg_f"])
+          }
           df["ITEM"] = range(1, len(df) + 1)
           df = df[colunas_tmk]
         else:
@@ -3077,13 +3602,22 @@ class TelaConfiguracaoProjeto(ctk.CTkFrame):
               "Material",
               "Complemento",
               "Girar",
+              "_delta_comp_f",
+              "_delta_larg_f",
           ]
           df = (
               df.groupby(cols_agrupar, as_index=False, dropna=False)[
                   "Quantidade"
               ].sum()
           )
+          deltas_por_idx = {
+              idx: (float(row["_delta_comp_f"]), float(row["_delta_larg_f"]))
+              for idx, row in df.iterrows()
+              if (row["_delta_comp_f"] or row["_delta_larg_f"])
+          }
           df = df[colunas_p]
+
+    df.attrs["deltas_fundo"] = deltas_por_idx
     return df
 
   def iniciar_revisao(self):

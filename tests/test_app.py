@@ -331,5 +331,156 @@ class TestBaixarAtualizacao(unittest.TestCase):
       self.assertEqual(chamadas_progresso[-1], (len(conteudo), len(conteudo)))
 
 
+class TestAjustesConferenciaFundoEContraFrente(unittest.TestCase):
+  """Testa os ajustes de conferência:
+  1) Fundo 6mm: avanço de 5mm -> 8mm de cada lado (+6mm no total):
+     - Armários com Base e Chapéu (roupeiros e aéreos): +6mm nas duas medidas
+     - Balcões inferiores e gavetas: +6mm apenas na largura (em relação à
+       Base ou à Contra Frente)
+  2) Contra Frente / Contra Fundo de Gaveta: -3mm na altura (menor medida)
+  """
+
+  def _montar_xml_completo(self) -> ET.Element:
+    xml_str = """
+    <ROOT>
+      <AMBIENTS>
+        <AMBIENT DESCRIPTION="Projeto - Cozinha e Quarto">
+          <!-- 1) Armário Aéreo (tem Base Sup e Chapeu Sup) -->
+          <ITEM DESCRIPTION="Armário Aéreo 2P" STRUCTURE="Y">
+            <ITEM DESCRIPTION="Base Sup" STRUCTURE="N" FAMILY="COZ" ISGEOMETRY="Y" WIDTH="770" DEPTH="330" HEIGHT="15">
+              <REFERENCES><MATERIAL REFERENCE="MDF Branco" /></REFERENCES>
+            </ITEM>
+            <ITEM DESCRIPTION="Chapeu Sup" STRUCTURE="N" FAMILY="COZ" ISGEOMETRY="Y" WIDTH="770" DEPTH="330" HEIGHT="15">
+              <REFERENCES><MATERIAL REFERENCE="MDF Branco" /></REFERENCES>
+            </ITEM>
+            <ITEM DESCRIPTION="Fundo Mod Sup" STRUCTURE="N" FAMILY="COZ" ISGEOMETRY="Y" WIDTH="780" DEPTH="680" HEIGHT="6">
+              <REFERENCES><MATERIAL REFERENCE="MDF Branco" /></REFERENCES>
+            </ITEM>
+          </ITEM>
+
+          <!-- 2) Roupeiro com Gaveta interna (tem Base Dor, Chapeu Dor, Fundo Dor e Fundo Gaveta) -->
+          <ITEM DESCRIPTION="Roupeiro 2 Portas" STRUCTURE="Y">
+            <ITEM DESCRIPTION="Base Dor" STRUCTURE="N" FAMILY="DOR" ISGEOMETRY="Y" WIDTH="1570" DEPTH="550" HEIGHT="15">
+              <REFERENCES><MATERIAL REFERENCE="MDF Branco" /></REFERENCES>
+            </ITEM>
+            <ITEM DESCRIPTION="Chapeu Dor" STRUCTURE="N" FAMILY="DOR" ISGEOMETRY="Y" WIDTH="1570" DEPTH="550" HEIGHT="15">
+              <REFERENCES><MATERIAL REFERENCE="MDF Branco" /></REFERENCES>
+            </ITEM>
+            <ITEM DESCRIPTION="Fundo Dor" STRUCTURE="N" FAMILY="DOR" ISGEOMETRY="Y" WIDTH="1580" DEPTH="2180" HEIGHT="6">
+              <REFERENCES><MATERIAL REFERENCE="MDF Branco" /></REFERENCES>
+            </ITEM>
+            <ITEM DESCRIPTION="Contra Frente" STRUCTURE="N" FAMILY="DOR" ISGEOMETRY="Y" WIDTH="700" DEPTH="120" HEIGHT="15">
+              <REFERENCES><MATERIAL REFERENCE="MDF Branco" /></REFERENCES>
+            </ITEM>
+            <ITEM DESCRIPTION="Fundo Gaveta" STRUCTURE="N" FAMILY="DOR" ISGEOMETRY="Y" WIDTH="710" DEPTH="450" HEIGHT="6">
+              <REFERENCES><MATERIAL REFERENCE="MDF Branco" /></REFERENCES>
+            </ITEM>
+          </ITEM>
+
+          <!-- 3) Balcão Inferior (tem Base Inf, sem Chapeu) -->
+          <ITEM DESCRIPTION="Mod. Inferior 2 Portas" STRUCTURE="Y">
+            <ITEM DESCRIPTION="Base Inf" STRUCTURE="N" FAMILY="COZ" ISGEOMETRY="Y" WIDTH="770" DEPTH="550" HEIGHT="15">
+              <REFERENCES><MATERIAL REFERENCE="MDF Branco" /></REFERENCES>
+            </ITEM>
+            <ITEM DESCRIPTION="Fundo Inf" STRUCTURE="N" FAMILY="COZ" ISGEOMETRY="Y" WIDTH="780" DEPTH="680" HEIGHT="6">
+              <REFERENCES><MATERIAL REFERENCE="MDF Branco" /></REFERENCES>
+            </ITEM>
+          </ITEM>
+        </AMBIENT>
+      </AMBIENTS>
+    </ROOT>
+    """
+    return ET.fromstring(xml_str)
+
+  def test_fundo_armario_aereo_e_roupeiro_soma_6mm_nas_duas_medidas(self):
+    root = self._montar_xml_completo()
+    items = root.findall(".//ITEM")
+    parent_map = {c: p for p in root.iter() for c in p}
+    ctx = app.mapear_contexto_modulos_xml(items, parent_map)
+
+    fundo_aereo = [i for i in items if i.attrib.get("DESCRIPTION") == "Fundo Mod Sup"][0]
+    fundo_roup = [i for i in items if i.attrib.get("DESCRIPTION") == "Fundo Dor"][0]
+
+    self.assertEqual(
+        app.calcular_delta_fundo_xml(
+            fundo_aereo, app.extrair_referencias(fundo_aereo), parent_map, ctx
+        ),
+        (6.0, 6.0),
+    )
+    self.assertEqual(
+        app.calcular_delta_fundo_xml(
+            fundo_roup, app.extrair_referencias(fundo_roup), parent_map, ctx
+        ),
+        (6.0, 6.0),
+    )
+
+  def test_fundo_balcao_inferior_e_gaveta_soma_6mm_apenas_na_largura(self):
+    root = self._montar_xml_completo()
+    items = root.findall(".//ITEM")
+    parent_map = {c: p for p in root.iter() for c in p}
+    ctx = app.mapear_contexto_modulos_xml(items, parent_map)
+
+    fundo_balcao = [i for i in items if i.attrib.get("DESCRIPTION") == "Fundo Inf"][0]
+    fundo_gaveta = [i for i in items if i.attrib.get("DESCRIPTION") == "Fundo Gaveta"][0]
+
+    self.assertEqual(
+        app.calcular_delta_fundo_xml(
+            fundo_balcao, app.extrair_referencias(fundo_balcao), parent_map, ctx
+        ),
+        (6.0, 0.0),
+    )
+    self.assertEqual(
+        app.calcular_delta_fundo_xml(
+            fundo_gaveta, app.extrair_referencias(fundo_gaveta), parent_map, ctx
+        ),
+        (6.0, 0.0),
+    )
+
+  def test_contra_frente_reduz_3mm_na_menor_medida_altura(self):
+    self.assertEqual(app.calcular_delta_contra_frente(500, 120), (0.0, -3.0))
+    self.assertEqual(app.calcular_delta_contra_frente(120, 500), (-3.0, 0.0))
+
+  def test_aplicar_ajustes_medidas_df_padrao_e_tmk(self):
+    import pandas as pd
+
+    df = pd.DataFrame(
+        [
+            [1, 770.0, 330.0, "Base", "MDF 15 mm", "Armário Aéreo"],
+            [1, 770.0, 330.0, "Tampo", "MDF 15 mm", "Armário Aéreo"],
+            [1, 780.0, 680.0, "Fundo", "MDF 6 mm", "Armário Aéreo"],
+            [1, 770.0, 550.0, "Base", "MDF 15 mm", "Balcão Inferior"],
+            [1, 780.0, 680.0, "Fundo", "MDF 6 mm", "Balcão Inferior"],
+            [2, 500.0, 120.0, "Contra Frente / Contra Fundo de Gaveta", "MDF 15 mm", "Gaveteiro"],
+            [1, 510.0, 450.0, "Fundo", "MDF 6 mm", "Gaveteiro"],
+            [1, 800.0, 600.0, "Fundo", "MDF 15 mm", "Armário Aéreo"],  # Fundo 15mm não altera
+        ],
+        columns=["Quantidade", "Comprimento", "Largura", "Função", "Material", "Complemento"],
+    )
+
+    df_ajustado = app.aplicar_ajustes_medidas_df(
+        df, avanco_fundo_8mm=True, reduzir_contra_frente_3mm=True
+    )
+
+    # Armário aéreo (Base + Tampo): Fundo 6mm soma +6 nas duas medidas
+    self.assertEqual(df_ajustado.loc[2, "Comprimento"], 786.0)
+    self.assertEqual(df_ajustado.loc[2, "Largura"], 686.0)
+
+    # Balcão inferior (só Base): Fundo 6mm soma +6 apenas na largura (780 -> 786)
+    self.assertEqual(df_ajustado.loc[4, "Comprimento"], 786.0)
+    self.assertEqual(df_ajustado.loc[4, "Largura"], 680.0)
+
+    # Contra Frente / Contra Fundo: reduz 3mm na altura (menor medida: 120 -> 117)
+    self.assertEqual(df_ajustado.loc[5, "Comprimento"], 500.0)
+    self.assertEqual(df_ajustado.loc[5, "Largura"], 117.0)
+
+    # Fundo de gaveta: soma +6 apenas na largura em relação à Contra Frente (510 -> 516)
+    self.assertEqual(df_ajustado.loc[6, "Comprimento"], 516.0)
+    self.assertEqual(df_ajustado.loc[6, "Largura"], 450.0)
+
+    # Fundo de 15mm: permanece inalterado
+    self.assertEqual(df_ajustado.loc[7, "Comprimento"], 800.0)
+    self.assertEqual(df_ajustado.loc[7, "Largura"], 600.0)
+
+
 if __name__ == "__main__":
   unittest.main()
