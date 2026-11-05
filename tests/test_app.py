@@ -534,5 +534,43 @@ class TestPersistenciaHistorico(unittest.TestCase):
       )
 
 
+class TestSubstituicaoInPlaceAtualizacao(unittest.TestCase):
+  """Garante que a atualização substitui o .exe no mesmo lugar sem criar outro."""
+
+  def test_substitui_executavel_no_mesmo_lugar_e_limpa_meipass(self):
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      exe_existente = os.path.join(tmpdir, "app.exe")
+      novo_baixado = os.path.join(tempfile.gettempdir(), "_teste_update_novo.tmp")
+      with open(exe_existente, "wb") as f:
+        f.write(b"VERSAO_ANTIGA")
+      with open(novo_baixado, "wb") as f:
+        f.write(b"VERSAO_NOVA_ATUALIZADA")
+
+      with (
+          mock.patch.object(sys, "executable", exe_existente),
+          mock.patch.dict(os.environ, {"_MEIPASS2": "C:/Temp/_MEI12345"}),
+          mock.patch("atualizador.subprocess.Popen") as mock_popen,
+          mock.patch("atualizador.os._exit") as mock_exit,
+      ):
+        app.aplicar_atualizacao_e_reiniciar(novo_baixado)
+
+      # O arquivo original deve ter sido substituído no mesmo caminho
+      self.assertTrue(os.path.exists(exe_existente))
+      with open(exe_existente, "rb") as f:
+        self.assertEqual(f.read(), b"VERSAO_NOVA_ATUALIZADA")
+
+      # Nenhum arquivo extra (_app_novo_*.exe ou _atualizar.bat) deve existir na pasta
+      self.assertEqual(os.listdir(tmpdir), ["app.exe"])
+
+      # Deve ter reiniciado o próprio exe_existente sem _MEIPASS2 no ambiente
+      mock_popen.assert_called_once()
+      args_chamada, kwargs_chamada = mock_popen.call_args
+      self.assertEqual(args_chamada[0], [os.path.abspath(exe_existente)])
+      self.assertNotIn("_MEIPASS2", kwargs_chamada["env"])
+      mock_exit.assert_called_once_with(0)
+
+
 if __name__ == "__main__":
   unittest.main()

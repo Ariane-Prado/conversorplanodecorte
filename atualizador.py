@@ -1,8 +1,11 @@
 """Persistência de configurações locais e sistema de atualização automática."""
+import glob
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.request
 
 from constantes import URL_VERSAO_REMOTA, VERSAO_ATUAL
@@ -109,70 +112,123 @@ def baixar_atualizacao(url_download: str, destino: str, progresso_callback=None)
     raise RuntimeError("Arquivo baixado parece inválido (muito pequeno).")
 
 
-def aplicar_atualizacao_e_reiniciar(caminho_novo_exe: str):
-  """Substitui o .exe em execução pelo baixado e reabre o app (Windows).
+def _ambiente_limpo_pyinstaller() -> dict:
+  """Remove variáveis internas do bootloader PyInstaller (_MEIPASS2 etc.).
 
-  Um .exe não pode se auto-sobrescrever enquanto roda, então isso grava um
-  .bat que espera este processo terminar, move o arquivo novo por cima do
-  antigo e reabre o app.
-
-  A janela do .bat fica visível (com título e mensagem) e o script não se
-  autodestrói mais no final — um script oculto que troca um executável e
-  apaga a si mesmo é exatamente o padrão que antivírus/EDR costumam
-  bloquear por heurística de auto-replicação, mesmo sendo legítimo aqui.
-  O arquivo `_atualizar.bat` fica na pasta do app e é sobrescrito na
-  próxima atualização.
-
-  O `move` tem retry: mesmo depois do processo antigo sumir do tasklist,
-  o Windows (ou o antivírus fazendo scan em tempo real do .exe recém-
-  baixado) pode segurar o arquivo travado por mais um instante — sem
-  retry isso falhava com "Acesso negado" e reabria o app antigo sem
-  trocar nada.
-
-  O limite de tentativas é de 5 minutos: em máquinas mais lentas o
-  antivírus pode demorar bem mais que alguns segundos pra liberar um
-  .exe desconhecido recém-baixado (visto na prática — 60 tentativas de
-  1s, ou seja 1 minuto, não foi suficiente e a troca falhava mesmo com
-  o arquivo íntegro).
+  Sem isso, o processo filho herda `_MEIPASS2` apontando para a pasta `_MEI...`
+  da versão antiga e reabre o código antigo em vez de descompactar o novo `.exe`.
   """
-  exe_atual = sys.executable
-  pasta = os.path.dirname(exe_atual)
-  bat_path = os.path.join(pasta, "_atualizar.bat")
-  pid_atual = os.getpid()
+  env = os.environ.copy()
+  for chave in list(env.keys()):
+    if chave == "_MEIPASS2" or chave.startswith("_PYI_") or chave.startswith("_MEI"):
+      env.pop(chave, None)
+  return env
 
+
+def limpar_residuos_atualizacao() -> None:
+  """Remove arquivos temporários de atualizações anteriores (`_app_novo_*.exe`,
+  `_atualizar.bat`, `_app_antigo*.tmp`, `_conversor_old_*.tmp`)."""
+  pasta_base = obter_caminho_base()
+  padroes = [
+      os.path.join(pasta_base, "_atualizar.bat"),
+      os.path.join(pasta_base, "_app_novo_*.exe"),
+      os.path.join(pasta_base, "_app_antigo*.tmp"),
+      os.path.join(tempfile.gettempdir(), "_conversor_old_*.tmp"),
+      os.path.join(tempfile.gettempdir(), "_conversor_update_*.tmp"),
+  ]
+  for padrao in padroes:
+    for caminho in glob.glob(padrao):
+      try:
+        os.remove(caminho)
+      except OSError:
+        pass
+
+
+def aplicar_atualizacao_e_reiniciar(caminho_novo_exe: str):
+  """Substitui o .exe em execução no próprio lugar (in-place) e reabre o app.
+
+  No Windows (NTFS), um executável em execução não pode ser sobrescrito
+  diretamente, mas pode ser renomeado/movido para `%TEMP%` enquanto ainda roda.
+  Assim:
+  1. Renomeamos o `app.exe` atual para um arquivo temporário em `%TEMP%`.
+  2. Movemos o novo executável baixado diretamente para o caminho original do
+     `app.exe` (sem deixar cópias `_app_novo_*.exe` nem `_atualizar.bat` na pasta).
+  3. Iniciamos o novo `app.exe` com o ambiente limpo (sem `_MEIPASS2`) e
+     encerramos o processo antigo.
+  """
+  exe_atual = os.path.abspath(sys.executable)
+  pasta = os.path.dirname(exe_atual)
+  pid_atual = os.getpid()
+  pasta_temp = tempfile.gettempdir()
+  env_limpo = _ambiente_limpo_pyinstaller()
+
+  caminho_old = os.path.join(pasta_temp, f"_conversor_old_{pid_atual}.tmp")
+  substituido_in_place = False
+
+  try:
+    try:
+      os.replace(exe_atual, caminho_old)
+    except OSError:
+      # Fallback caso %TEMP% esteja em outro disco (ex.: D:\ vs C:\)
+      caminho_old = os.path.join(pasta, f"_app_antigo_{pid_atual}.tmp")
+      os.replace(exe_atual, caminho_old)
+
+    try:
+      shutil.move(caminho_novo_exe, exe_atual)
+      substituido_in_place = True
+    except Exception:
+      # Se falhar ao colocar o novo no lugar, restaura o executável original
+      if os.path.exists(caminho_old) and not os.path.exists(exe_atual):
+        os.replace(caminho_old, exe_atual)
+      raise
+  except Exception:
+    substituido_in_place = False
+
+  if substituido_in_place:
+    limpar_residuos_atualizacao()
+    flags = 0
+    if os.name == "nt":
+      flags = (
+           getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+          | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+      )
+    subprocess.Popen(
+        [exe_atual],
+        cwd=pasta,
+        env=env_limpo,
+        close_fds=True,
+        creationflags=flags,
+    )
+    os._exit(0)
+    return
+
+  # Fallback via script em %TEMP% caso o antivírus impeça o rename imediato
+  bat_path = os.path.join(pasta_temp, f"_conversor_atualizar_{pid_atual}.bat")
   conteudo_bat = (
       "@echo off\n"
-      "title Atualizando Conversor XML Promob\n"
-      "echo Aplicando atualizacao, aguarde...\n"
-      ":espera\n"
-      f'tasklist /FI "PID eq {pid_atual}" 2>NUL | find /I "{pid_atual}" >NUL\n'
-      "if not errorlevel 1 (\n"
-      "    timeout /t 1 /nobreak >NUL\n"
-      "    goto espera\n"
-      ")\n"
       "set tentativas=0\n"
       ":mover\n"
       f'move /Y "{caminho_novo_exe}" "{exe_atual}" >NUL 2>&1\n'
       "if errorlevel 1 (\n"
       "    set /a tentativas+=1\n"
-      "    if %tentativas% GEQ 300 (\n"
-      "        echo Nao foi possivel substituir o executavel apos 5 minutos"
-      " (arquivo ainda em uso ou bloqueado pelo antivirus).\n"
-      "        echo Tente novamente ou substitua manualmente pelo arquivo"
-      " baixado em:\n"
-      f"        echo {caminho_novo_exe}\n"
-      "        pause\n"
-      "        exit /b 1\n"
-      "    )\n"
-      "    timeout /t 1 /nobreak >NUL\n"
+      "    if %tentativas% GEQ 120 exit /b 1\n"
+      "    ping 127.0.0.1 -n 2 >NUL\n"
       "    goto mover\n"
       ")\n"
       f'start "" "{exe_atual}"\n'
+      f'del /Q "{bat_path}" >NUL 2>&1\n'
       "exit\n"
   )
   with open(bat_path, "w", encoding="utf-8") as f:
     f.write(conteudo_bat)
 
-  subprocess.Popen(["cmd", "/c", bat_path], close_fds=True)
+  flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
+  subprocess.Popen(
+      ["cmd", "/c", bat_path],
+      cwd=pasta_temp,
+      env=env_limpo,
+      close_fds=True,
+      creationflags=flags,
+  )
   os._exit(0)
 

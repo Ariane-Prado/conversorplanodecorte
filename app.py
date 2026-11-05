@@ -13,6 +13,7 @@ import datetime
 import json
 import os
 import sys
+import tempfile
 import threading
 from tkinter import messagebox
 import urllib.request
@@ -23,6 +24,7 @@ from atualizador import (  # noqa: F401
     aplicar_atualizacao_e_reiniciar,
     baixar_atualizacao,
     carregar_config,
+    limpar_residuos_atualizacao,
     obter_caminho_base,
     salvar_config,
     verificar_nova_versao,
@@ -126,6 +128,7 @@ class ConversorXmlExcelApp(ctk.CTk):
     self.arquivo_historico_usuario = os.path.join(
         os.path.expanduser("~"), ".conversor_promob_historico.json"
     )
+    limpar_residuos_atualizacao()
     self.historico = self.carregar_historico()
 
     self.frame_topo = ctk.CTkFrame(self, fg_color="transparent")
@@ -286,8 +289,10 @@ class ConversorXmlExcelApp(ctk.CTk):
         )
 
     def worker():
-      pasta = os.path.dirname(sys.executable)
-      destino = os.path.join(pasta, f"_app_novo_{versao_nova}.exe")
+      pasta_temp = tempfile.gettempdir()
+      destino = os.path.join(
+          pasta_temp, f"_conversor_update_{versao_nova}_{os.getpid()}.tmp"
+      )
       try:
         baixar_atualizacao(url_download, destino, progresso_callback=progresso)
       except Exception as e:

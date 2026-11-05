@@ -12,7 +12,7 @@ COR_FUNDO_INPUT = "#2B2B2B"
 COR_BORDA_INPUT = "#444444"
 COR_FOCO_INPUT = "#2980b9"
 
-VERSAO_ATUAL = "1.3.1"
+VERSAO_ATUAL = "1.3.2"
 URL_VERSAO_REMOTA = (
     "https://raw.githubusercontent.com/Ariane-Prado/conversorplanodecorte"
     "/main/versao.json"
